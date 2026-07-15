@@ -13,9 +13,10 @@ The JS/TS SDK mirrors 100% of the functionality of the original C# Unity SDK, of
 3. [User Profile & Balance](#3-user-profile--balance)
 4. [Rooms API (Singleplayer Match Lifecycle)](#4-rooms-api-singleplayer-match-lifecycle)
 5. [Special Tournaments](#5-special-tournaments)
-6. [Session Reconnection & Progress Saving](#6-session-reconnection--progress-saving)
-7. [Dedicated Server Authoritative Mode](#7-dedicated-server-authoritative-mode)
-8. [Complete Phaser 3 Scenes Example](#8-complete-phaser-3-scenes-example)
+6. [Hall of Fame](#6-hall-of-fame)
+7. [Session Reconnection & Progress Saving](#7-session-reconnection--progress-saving)
+8. [Dedicated Server Authoritative Mode](#8-dedicated-server-authoritative-mode)
+9. [Complete Phaser 3 Scenes Example](#9-complete-phaser-3-scenes-example)
 
 ---
 
@@ -174,7 +175,63 @@ const success = await this.funtico.sdk.ResultTournament_Client(
 
 ---
 
-## 6. Session Reconnection & Progress Saving
+## 6. Hall of Fame
+
+The Hall of Fame is a persistent leaderboard that ranks players by their best single result, available as an all-time (`Global`) or current-month (`Monthly`) standing, optionally narrowed to one game mode.
+
+### Fetching Rankings
+
+```typescript
+import { HallOfFamePeriodMode, HallOfFameGameModeFilter } from './sdk/FunticoPhaserSDK';
+
+// All-time top 10, across every game mode
+const global = await this.funtico.sdk.GetHallOfFame(HallOfFamePeriodMode.Global);
+
+// Current month, Rooms only, second page
+const monthly = await this.funtico.sdk.GetHallOfFame(
+  HallOfFamePeriodMode.Monthly,
+  2,  // page
+  10, // limit
+  HallOfFameGameModeFilter.Rooms
+);
+
+monthly.leaderboard.forEach(p => console.log(`#${p.rank} ${p.displayName} - ${p.totalPoints}`));
+
+// The requesting player's own standing, even if they are not on this page.
+// Null until they have at least one ranked result.
+if (monthly.currentPlayer) {
+  console.log(`Your rank: #${monthly.currentPlayer.rank} of ${monthly.totalPlayers}`);
+}
+```
+
+> **Note:** Hall of Fame responses use **camelCase** field names (`displayName`, `totalPoints`), unlike the PascalCase used by the Rooms and Tournaments endpoints.
+
+### Prize Distribution
+
+```typescript
+import { PrizeType } from './sdk/FunticoPhaserSDK';
+
+const distribution = await this.funtico.sdk.GetHallOfFameDistribution();
+
+distribution.items.forEach(item => {
+  // Places 1-10 expose `place` only; grouped tiers also expose `endPlace` and `range` ("11-20")
+  const label = item.range ?? `#${item.place}`;
+
+  item.prizes.forEach(prize => {
+    if (prize.type === PrizeType.Item) {
+      console.log(`${label}: ${prize.Amount}x ${prize.Item?.name}`);
+    } else {
+      console.log(`${label}: ${prize.Value} TICO`);
+    }
+  });
+});
+```
+
+> **Note:** Distribution prizes carry a lowercase `type` discriminator but **PascalCase** value fields (`Value`, `Amount`, `ItemId`) — the `HOFPrize` union models this exactly. Item artwork is at `prize.Item.image`; load it with Phaser's own loader.
+
+---
+
+## 7. Session Reconnection & Progress Saving
 
 If a player loses connection or reloads their page during a match, you can save their state to allow them to reconnect and resume the match.
 
@@ -220,7 +277,7 @@ console.log(`Session restored! Score: ${savedState.score}, HP: ${savedState.hp}`
 
 ---
 
-## 7. Dedicated Server Authoritative Mode
+## 8. Dedicated Server Authoritative Mode
 
 For games utilizing dedicated multiplayer game servers, the SDK provides secure server-authoritative methods validated via the `X-Server-Key` header.
 
@@ -253,7 +310,7 @@ For games utilizing dedicated multiplayer game servers, the SDK provides secure 
 
 ---
 
-## 8. Complete Phaser 3 Scenes Example
+## 9. Complete Phaser 3 Scenes Example
 
 ### BootScene.ts (Initialization and Reconnect Scan)
 ```typescript

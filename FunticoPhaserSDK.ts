@@ -61,6 +61,35 @@ export enum UserGameStatus {
 }
 
 /**
+ * Hall of Fame ranking period.
+ */
+export enum HallOfFamePeriodMode {
+  Global = 0,
+  Monthly = 1
+}
+
+/**
+ * Game mode filter for Hall of Fame rankings. Use this in game code.
+ */
+export enum HallOfFameGameModeFilter {
+  All = 0,                 // No filter - ranks across every mode
+  SpecialTournament = 1,
+  Rooms = 2,
+  Practice = 3
+}
+
+/**
+ * Backend `gameMode` query values for the /HallOfFame endpoints.
+ * Deliberately offset by one from HallOfFameGameModeFilter, which has no `All` equivalent.
+ * Wire-level detail - prefer HallOfFameGameModeFilter.
+ */
+export enum HallOfFameGameMode {
+  SpecialTournament = 0,
+  Rooms = 1,
+  Practice = 2
+}
+
+/**
  * Prize types mapped directly to the Funtico backend enum.
  */
 export enum PrizeType {
@@ -451,6 +480,88 @@ export interface ServerUserData {
   FunticoUserId: number;  // Platform user ID
   SdkUserId: number;      // Database user ID
   UserStatus: UserGameStatus;
+}
+
+/**
+ * Hall of Fame leaderboard entry.
+ *
+ * Fields are camelCase, unlike the rest of this SDK: the /HallOfFame DTOs declare explicit
+ * lowercase [JsonProperty] names, which win over the PascalCase resolver the other endpoints use.
+ * Do not "fix" these to PascalCase for consistency - every field would silently read undefined.
+ * Nullable fields are sent as explicit null rather than omitted, hence `| null`.
+ */
+export interface HallOfFamePlayerEntry {
+  userId: number;
+  funticoId: number;
+  displayName: string;
+  avatarUrl?: string | null;
+  avatarType?: string | null;
+  avatarBorder?: string | null;
+  country?: string | null;
+  rank: number;
+  totalPoints: number;      // The player's best single score, not a sum
+  gamesPlayed: number;
+  playedAt?: string | null; // ISO-8601 timestamp of the ranked run
+  borderType?: string | null;
+}
+
+/**
+ * Paginated Hall of Fame ranking response.
+ */
+export interface HallOfFameResponse {
+  leaderboard: HallOfFamePlayerEntry[];
+  currentPlayer?: HallOfFamePlayerEntry | null;  // null when the player has no ranked results
+  totalPlayers: number;
+  page: number;
+  limit: number;
+}
+
+/**
+ * GPP (TICO) prize inside a Hall of Fame distribution tier.
+ *
+ * The mixed casing is real: the backend PrizeConverter hardcodes a lowercase `type` but writes
+ * every other field via reflection on the C# property name, ignoring [JsonProperty]. This shape
+ * therefore differs from the `Prize` union above, which models a different endpoint's contract.
+ */
+export interface HOFGppPrize {
+  type: PrizeType.GppPerPlayer;
+  Currency: number;
+  Value: number;
+  Percentage?: number;  // The converter omits null fields entirely
+}
+
+/**
+ * Platform item prize inside a Hall of Fame distribution tier.
+ * The nested `Item` keeps lowercase fields - it is serialized by its own [JsonProperty]
+ * attributes rather than by the PrizeConverter.
+ */
+export interface HOFItemPrize {
+  type: PrizeType.Item;
+  ItemId: number;
+  Amount: number;
+  Item?: PlatformItemPrize;
+}
+
+/**
+ * Prize variations returned by /HallOfFame/distribution.
+ */
+export type HOFPrize = HOFGppPrize | HOFItemPrize;
+
+/**
+ * A single place (1-10) or a grouped place range (11-20, 21-50) in the distribution.
+ */
+export interface HOFDistributionItem {
+  place: number;
+  endPlace?: number;  // Absent for individual places 1-10
+  range?: string;     // Absent for individual places 1-10; e.g. "11-20"
+  prizes: HOFPrize[];
+}
+
+/**
+ * Hall of Fame prize distribution table.
+ */
+export interface HOFDistributionResponse {
+  items: HOFDistributionItem[];
 }
 
 /**
@@ -1099,6 +1210,69 @@ export class FunticoSDK {
 
     this.CloseCurrentSession_Client();
     return await response.json(); // returns boolean success
+  }
+
+  /* ================= Hall of Fame Methods ================= */
+
+  /**
+   * Fetches a page of the Hall of Fame ranking.
+   * @param mode     Global (all-time) or Monthly (current calendar month, UTC).
+   * @param page     1-based page index.
+   * @param limit    Entries per page.
+   * @param gameMode Restricts the ranking to a single mode; All applies no filter.
+   */
+  public async GetHallOfFame(
+    mode: HallOfFamePeriodMode,
+    page = 1,
+    limit = 10,
+    gameMode: HallOfFameGameModeFilter = HallOfFameGameModeFilter.All
+  ): Promise<HallOfFameResponse> {
+    let path: string;
+    switch (mode) {
+      case HallOfFamePeriodMode.Global:
+        path = "global";
+        break;
+      case HallOfFamePeriodMode.Monthly:
+        path = "monthly";
+        break;
+      default:
+        throw new Error(`Unsupported Hall of Fame period mode: ${mode}`);
+    }
+
+    let url = `${this.apiUri}/HallOfFame/${path}?page=${page}&limit=${limit}`;
+    if (gameMode !== HallOfFameGameModeFilter.All) {
+      url += `&gameMode=${this.mapHallOfFameGameMode(gameMode)}`;
+    }
+
+    const response = await fetch(url, {
+      headers: this.getAuthHeaders(false)
+    });
+    if (!response.ok) throw new Error("Failed to fetch Hall of Fame leaderboard");
+    return await response.json();
+  }
+
+  /**
+   * Fetches the Hall of Fame prize distribution table.
+   */
+  public async GetHallOfFameDistribution(): Promise<HOFDistributionResponse> {
+    const response = await fetch(`${this.apiUri}/HallOfFame/distribution`, {
+      headers: this.getAuthHeaders(false)
+    });
+    if (!response.ok) throw new Error("Failed to fetch Hall of Fame distribution");
+    return await response.json();
+  }
+
+  private mapHallOfFameGameMode(gameMode: HallOfFameGameModeFilter): HallOfFameGameMode {
+    switch (gameMode) {
+      case HallOfFameGameModeFilter.SpecialTournament:
+        return HallOfFameGameMode.SpecialTournament;
+      case HallOfFameGameModeFilter.Rooms:
+        return HallOfFameGameMode.Rooms;
+      case HallOfFameGameModeFilter.Practice:
+        return HallOfFameGameMode.Practice;
+      default:
+        throw new Error(`Unsupported Hall of Fame game mode filter: ${gameMode}`);
+    }
   }
 
   /* ================= Client Session Methods (Reconnection) ================= */
