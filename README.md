@@ -2,7 +2,12 @@
 
 This guide describes the setup and usage of the Funtico Games SDK for games running on the **Phaser 3** engine (including web games and Telegram Mini Apps).
 
-The JS/TS SDK mirrors 100% of the functionality of the original C# Unity SDK, offering complete method parity. This includes rooms/tournaments management, special tournaments, client-side session reconnection, and dedicated game server match validation.
+The SDK covers rooms and tournament management, special tournaments, the Hall of Fame leaderboard, and client-side session reconnection.
+
+## 📖 Documentation
+
+- **This guide** — installation and a task-oriented integration walkthrough. Start here.
+- [Usage Guide](./USAGE.md) — complete reference for every public method and type: signatures, parameters, return values, and field-by-field descriptions of every model.
 
 ---
 
@@ -15,8 +20,7 @@ The JS/TS SDK mirrors 100% of the functionality of the original C# Unity SDK, of
 5. [Special Tournaments](#5-special-tournaments)
 6. [Hall of Fame](#6-hall-of-fame)
 7. [Session Reconnection & Progress Saving](#7-session-reconnection--progress-saving)
-8. [Dedicated Server Authoritative Mode](#8-dedicated-server-authoritative-mode)
-9. [Complete Phaser 3 Scenes Example](#9-complete-phaser-3-scenes-example)
+8. [Complete Phaser 3 Scenes Example](#8-complete-phaser-3-scenes-example)
 
 ---
 
@@ -79,12 +83,15 @@ Before invoking any API methods, you must initialize the SDK with your game cred
 // Initializing inside BootScene
 await this.funtico.init({
   env: FunticoEnvironment.STAGING, // STAGING or PROD
-  publicGameKey: "your-public-key", // Verified on the backend as X-User-Key
-  privateGameKey: "your-private-key", // Game secret key used for signing/encryption
+  publicGameKey: "your-public-key", // Public key, sent with every request
+  privateGameKey: "your-private-key", // Secret key - never ship it in a public client build
   userToken: "token-from-funtico-platform", // Automatically authenticates the player on startup
-  apiBaseUrl: "https://funtico-sdk-staging.azurewebsites.net" // Your Game API gateway endpoint (optional)
+  apiBaseUrl: "https://funtico-sdk-staging.azurewebsites.net", // Your Game API gateway endpoint (optional)
+  funticoApiBaseUrl: "https://staging.api.funtico.com" // Funtico platform API (optional)
 });
 ```
+
+Both URL overrides are optional — `env` resolves each to the right default. Note they are **two different hosts**: `apiBaseUrl` is your game's Rooms API and takes the game JWT, while `funticoApiBaseUrl` is the Funtico platform itself and takes the player's platform token. The leaderboard reads player names and avatars from the latter.
 
 ---
 
@@ -107,23 +114,32 @@ const canAfford = this.funtico.sdk.CanAffordFromCache(EntryFeeType.Tico, 500);
 
 ### Fetching Rooms and Configs
 ```typescript
-const rooms = await this.funtico.sdk.GetRooms();
+const tiers = await this.funtico.sdk.GetTiers();
+const rooms = await this.funtico.sdk.GetRooms();       // singleplayer by default
 const roomDetails = await this.funtico.sdk.GetRoom("room-guid");
 const roomSettings = await this.funtico.sdk.GetRoomSettings("event-guid");
+
+// Prize table for a room
+const prizes = await this.funtico.sdk.GetPrizePoolDistribution("room-guid");
+
+// Resolve a tier from an event id, using the list GetRooms already fetched
+const tier = await this.funtico.sdk.GetTierByEventId("event-guid");
 ```
 
 ### Match Lifecycle
-1. **JoinRoom**: Deducts fee/ticket and registers user participation.
+1. **JoinRoom**: Deducts the fee or ticket, registers participation, and starts the run.
    ```typescript
-   const sessionData = await this.funtico.sdk.JoinRoom(roomGuid, false); // false - do not use voucher
+   // Omit the second argument to let the SDK spend a voucher only when the player has one
+   const sessionData = await this.funtico.sdk.JoinRoom(roomGuid);
+
+   // Or decide explicitly:
+   // await this.funtico.sdk.JoinRoom(roomGuid, false); // never use a voucher
    ```
-2. **StartRoomSP**: Signals the server to start the match (activates timers on backend).
+   > The run is live once `JoinRoom` resolves and the server-side timers are already ticking.
+   > Load your level before calling it, not after.
+2. **EndRoomSP**: Submits the player's final score.
    ```typescript
-   await this.funtico.sdk.StartRoomSP(sessionData.EventId, sessionData.SessionOrMatchId);
-   ```
-3. **EndRoomSP**: Securely encrypts game score and submits results.
-   ```typescript
-   // Payload is AES-128-CBC encrypted and signed with HMAC-SHA256 automatically
+   // The SDK encrypts and signs the payload for you
    await this.funtico.sdk.EndRoomSP(
      sessionData.EventId,
      sessionData.SessionOrMatchId,
@@ -132,6 +148,20 @@ const roomSettings = await this.funtico.sdk.GetRoomSettings("event-guid");
      "127.0.0.1",
      ["start_game", "score_updated"] // Action logs used for anti-cheat validation
    );
+   ```
+3. **GetLeaderboard**: Reads the final standings and the player's own payout.
+   ```typescript
+   const board = await this.funtico.sdk.GetLeaderboard(
+     sessionData.EventId,
+     sessionData.SessionOrMatchId
+   );
+
+   // State is a LeadersState enum member, not a string
+   if (board.IsPending) this.showCalculatingResults();
+
+   // LeaderboardItems[].UserId is the platform id - match it against PlatformId
+   const me = this.funtico.sdk.GetCachedUserData();
+   const myRow = board.LeaderboardItems.find(i => i.UserId === me?.PlatformId);
    ```
 
 ---
@@ -147,29 +177,64 @@ import { TournamentsFilterEnum } from './sdk/FunticoPhaserSDK';
 // Get ongoing tournaments
 const tournaments = await this.funtico.sdk.GetTournaments(1, 100, TournamentsFilterEnum.OnGoing);
 
-// Get leaderboard
-const leaderboard = await this.funtico.sdk.GetTournamentLeaderboard("tournament-guid");
+const t = tournaments[0];
+console.log(`${t.Name} — starts ${t.StartDate}, up to ${t.EntryLimit} entries`);
+console.log(`${t.PrizePoolLabel} — entry fee ${t.EntryFee}`);
+// -> "Bottle Flip Tournament — starts 2026-05-14T21:00:00Z, up to 40 entries"
+// -> "50K TICO, Private Passes & More — entry fee 100"
+
+// t.Id is the tournament identifier every other tournament method accepts.
+const leaderboard = await this.funtico.sdk.GetTournamentLeaderboard(t.Id);
+
+leaderboard.Players.forEach(p => console.log(`#${p.Place} ${p.UserName} — ${p.Score}`));
+// -> "#1 Kepsert — 11675"
+
+// Match players by FunticoId, which is a platform id.
+const me = this.funtico.sdk.GetCachedUserData();
+const myRow = leaderboard.Players.find(p => p.FunticoId === me?.PlatformId);
 ```
+
+> **Note:** `TournamentViewModel.Id` is the identifier to pass to every other tournament method. The schedule fields are `StartDate` / `EndDate` and the attempt cap is `EntryLimit`. The leaderboard keeps each player's best score. See [USAGE.md](./USAGE.md) for the full field list.
 
 ### Joining and Entering Tournament
 ```typescript
-// 1. Join a tournament (called once per tournament lifecycle)
-const successJoin = await this.funtico.sdk.JoinTournament("tournament-guid", "community-guid", "password");
+// 1. Join — required before every EnterTournament. A scored attempt consumes the join,
+//    so join again before each new attempt. A join that cannot go through rejects.
+const successJoin = await this.funtico.sdk.JoinTournament(t.Id, "community-guid", "password");
 
 // 2. Enter a tournament match (called before starting each individual attempt)
-const enterData = await this.funtico.sdk.EnterTournament("tournament-guid");
-const saveScoreId = enterData.LocalTournamentUuid; // ID required to submit results
+const enterData = await this.funtico.sdk.EnterTournament(t.Id);
+
+// TournamentScoreUuid is the saveScoreId.
+const saveScoreId = enterData.TournamentScoreUuid;
 ```
+
+> **`TournamentScoreUuid` is the `saveScoreId`.** `EnterTournament` returns it, and it is the value to pass as `saveScoreId` to `ResultTournament_Client` / `ResultTournament_Server`.
 
 ### Submitting Results (Client-Side)
 ```typescript
-// Payload is encrypted automatically using the saveScoreId and the game's secret key
-const success = await this.funtico.sdk.ResultTournament_Client(
-  "tournament-guid",
-  saveScoreId,
+// The SDK encrypts and signs the payload for you
+await this.funtico.sdk.ResultTournament_Client(
+  t.Id,
+  saveScoreId,   // enterData.TournamentScoreUuid
   score,
   true, // isSuccess
   JSON.stringify({ kills: 12, levelCompleted: 4 }) // customData
+);
+
+// Resolves once the score is saved; a refused payload rejects.
+console.log('Score submitted');
+```
+
+### Tournament History
+```typescript
+const history = await this.funtico.sdk.GetTournamentsHistory(1, 10);
+
+// Meta.From/To are null on an empty page — a player with no history hits this branch.
+if (history.Meta?.From == null) console.log('No tournament history yet.');
+
+history.Entries.forEach(e =>
+  console.log(`${e.TournamentName} — place #${e.LeaderboardPlace}, best ${e.BestScore}`)
 );
 ```
 
@@ -220,14 +285,14 @@ distribution.items.forEach(item => {
   item.prizes.forEach(prize => {
     if (prize.type === PrizeType.Item) {
       console.log(`${label}: ${prize.Amount}x ${prize.Item?.name}`);
-    } else {
+    } else if (prize.type === PrizeType.GppPerPlayer) {
       console.log(`${label}: ${prize.Value} TICO`);
     }
   });
 });
 ```
 
-> **Note:** Distribution prizes carry a lowercase `type` discriminator but **PascalCase** value fields (`Value`, `Amount`, `ItemId`) — the `HOFPrize` union models this exactly. Item artwork is at `prize.Item.image`; load it with Phaser's own loader.
+> **Note:** Distribution prizes use the shared **`Prize`** union — the same one `GetPrizePoolDistribution` returns. Narrow on the lowercase `type`. The value fields are PascalCase (`Value`, `Amount`, `ItemId`, `PrizeId`, `Currency`) and the nested `Item` is lowercase (`id`/`image`/`name`). Item artwork is at `prize.Item.image`; load it with Phaser's own loader.
 
 ---
 
@@ -277,40 +342,7 @@ console.log(`Session restored! Score: ${savedState.score}, HP: ${savedState.hp}`
 
 ---
 
-## 8. Dedicated Server Authoritative Mode
-
-For games utilizing dedicated multiplayer game servers, the SDK provides secure server-authoritative methods validated via the `X-Server-Key` header.
-
-### Server Session Lifecycle:
-1. **Create Session when the match starts:**
-   ```typescript
-   import { UserGameStatus } from './sdk/FunticoPhaserSDK';
-
-   const players = [
-     { JoinKey: "key_1", FunticoUserId: 101, SdkUserId: 201, UserStatus: UserGameStatus.InGame }
-   ];
-   await this.funtico.sdk.CreateSession_Server("wss://dedicated-server.com:7777", "match-id-123", players);
-   ```
-2. **Record user action logs on the server:**
-   ```typescript
-   this.funtico.sdk.RecordEvent_Server(101, "player_captured_flag");
-   ```
-3. **Notify API when a player leaves the match:**
-   ```typescript
-   await this.funtico.sdk.UserLeaveSession_Server(101);
-   ```
-4. **Finalize match and submit scores for all participants at once:**
-   ```typescript
-   const results = [
-     { Score: 1500, UserId: 201, FunticoUserId: 101, UserIp: "8.8.8.8" }
-   ];
-   // Submits all results to /Rooms/end-room-all-users
-   await this.funtico.sdk.FinishRoomSession_Server("event-guid", "match-id-123", results);
-   ```
-
----
-
-## 9. Complete Phaser 3 Scenes Example
+## 8. Complete Phaser 3 Scenes Example
 
 ### BootScene.ts (Initialization and Reconnect Scan)
 ```typescript
@@ -341,7 +373,7 @@ export class BootScene extends Phaser.Scene {
 }
 ```
 
-### GameScene.ts (Gameplay, Autosaving and Encrypted Score Submission)
+### GameScene.ts (Gameplay, Autosaving and Score Submission)
 ```typescript
 import Phaser from 'phaser';
 import { GameTypeEnum } from '../sdk/FunticoPhaserSDK';
@@ -367,6 +399,7 @@ export class GameScene extends Phaser.Scene {
       this.registry.set('activeSession', session);
     } else {
       const room = this.registry.get('selectedRoom');
+
       session = await this.funtico.sdk.JoinRoom(room.Guid);
       this.registry.set('activeSession', session);
 
@@ -377,8 +410,6 @@ export class GameScene extends Phaser.Scene {
         session.EventId,
         session.SessionOrMatchId
       );
-
-      await this.funtico.sdk.StartRoomSP(session.EventId, session.SessionOrMatchId);
     }
 
     // Auto-save session state every 10 seconds
@@ -404,7 +435,7 @@ export class GameScene extends Phaser.Scene {
       session.EventId,
       session.SessionOrMatchId,
       this.score,
-      user.UserId,
+      user!.UserId,
       "127.0.0.1"
     );
 
