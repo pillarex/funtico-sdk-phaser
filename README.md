@@ -2,7 +2,7 @@
 
 This guide describes the setup and usage of the Funtico Games SDK for games running on the **Phaser 3** engine (including web games and Telegram Mini Apps).
 
-The SDK covers rooms and tournament management, special tournaments, the Hall of Fame leaderboard, and client-side session reconnection.
+The SDK covers rooms and tournament management, special tournaments, the Hall of Fame leaderboard, Campaign Mode, and client-side session reconnection.
 
 ## 📖 Documentation
 
@@ -19,8 +19,9 @@ The SDK covers rooms and tournament management, special tournaments, the Hall of
 4. [Rooms API (Singleplayer Match Lifecycle)](#4-rooms-api-singleplayer-match-lifecycle)
 5. [Special Tournaments](#5-special-tournaments)
 6. [Hall of Fame](#6-hall-of-fame)
-7. [Session Reconnection & Progress Saving](#7-session-reconnection--progress-saving)
-8. [Complete Phaser 3 Scenes Example](#8-complete-phaser-3-scenes-example)
+7. [Campaign Mode](#7-campaign-mode)
+8. [Session Reconnection & Progress Saving](#8-session-reconnection--progress-saving)
+9. [Complete Phaser 3 Scenes Example](#9-complete-phaser-3-scenes-example)
 
 ---
 
@@ -296,7 +297,123 @@ distribution.items.forEach(item => {
 
 ---
 
-## 7. Session Reconnection & Progress Saving
+## 7. Campaign Mode
+
+Campaign Mode is a fixed ladder of authored levels the player works through in order: start an attempt, play, report your metrics, and the server grades the run into stars, grants rewards, and unlocks the next level.
+
+> **Note:** Campaign responses are **PascalCase**, like most of the SDK (and unlike the camelCase Hall of Fame). Stars are computed **server-side** from the level's star rules — render them, never compute them. See [USAGE.md](./USAGE.md#campaign-methods) for the full reference.
+
+### Step 1 — Check Availability
+```typescript
+// "No campaign" is data, not an error - gate the menu button on the flag
+if (!(await this.funtico.sdk.IsCampaignAvailable())) {
+  this.campaignButton.setVisible(false);
+  return;
+}
+```
+
+### Step 2 — Fetch Levels and Render the Level Select
+```typescript
+import { CampaignLevelStatus } from './sdk/FunticoPhaserSDK';
+
+const campaign = await this.funtico.sdk.GetCampaignLevels();
+
+// Campaign-wide progress: stars earned out of the total obtainable
+this.progressText.setText(`${campaign.TotalStarsEarned} / ${campaign.MaxStars} ★`);
+
+for (const level of campaign.Levels) {
+  if (level.Status === CampaignLevelStatus.Locked) {
+    // Locked levels arrive without config or star rules - render a lock icon and move on
+    this.addLockedCard(level.Order, level.Name);
+  } else {
+    // Unlocked/Completed: show the best-star row (0-3) and make the card clickable
+    this.addLevelCard(level.Order, level.Name, level.BestStars, () => this.play(level));
+  }
+}
+```
+
+### Step 3 — Parse the Level Config with Your Own Type
+```typescript
+// The schema is your game's - the platform stores the string untouched
+interface MyLevelConfig {
+  enemyWaves: number;
+  timeLimitSeconds: number;
+  tilemapKey: string;
+}
+
+const config = this.funtico.sdk.GetCampaignLevelConfig<MyLevelConfig>(level);
+// Throws a clear Error if the level is still locked or the JSON is malformed
+```
+
+### Step 4 — Start the Attempt and Play
+```typescript
+const attempt = await this.funtico.sdk.StartCampaignLevel(level.Id);
+
+// Optional: record gameplay events - they are folded into the completion payload
+this.funtico.sdk.RecordEvent_Client('wave_1_cleared');
+
+// Re-starting simply replaces the tracked attempt; quitting without finishing?
+// this.funtico.sdk.AbandonCampaignAttempt(); // local-only, no server call
+```
+
+### Step 5 — Complete the Run and Show the Outcome
+```typescript
+// Metrics: flat map, 1-32 entries, finite numbers or booleans.
+// Fractional numbers are ALLOWED (metrics are doubles) - unlike EndRoomSP's int score.
+const result = await this.funtico.sdk.CompleteCampaignLevel({
+  time: 47.35,          // fractional survives intact
+  coins: 120,
+  no_damage: true       // booleans are sent as 1/0
+});
+
+if (result.IsWin) {
+  this.showStars(result.Stars);                       // graded server-side
+  this.showRewards(result.Rewards, result.RewardsGranted);
+  if (result.UnlockedLevelId) this.showUnlockBanner();
+} else {
+  this.showDefeat();    // losing is a normal 200 - IsWin false, Stars 0, not an error
+}
+```
+
+Failures reject with a `CampaignError` whose `Code` is machine-readable — branch on it:
+
+```typescript
+import { CampaignError, CampaignErrorCode } from './sdk/FunticoPhaserSDK';
+
+try {
+  await this.funtico.sdk.StartCampaignLevel(level.Id);
+} catch (error) {
+  if (error instanceof CampaignError && error.Code === CampaignErrorCode.LevelLocked) {
+    this.showToast('Finish the previous level first!');
+  } else {
+    throw error;
+  }
+}
+```
+
+### Step 6 — Listen for Progress Updates
+```typescript
+import { FunticoPhaserPlugin } from './sdk/FunticoPhaserSDK';
+
+// The plugin wrappers emit CAMPAIGN_PROGRESS_UPDATED with what they fetched/received:
+// refreshCampaign -> CampaignLevelsViewModel, completeCampaignLevel -> CampaignCompletionResult.
+// Both carry TotalLevels/CompletedLevels/TotalStarsEarned/MaxStars.
+this.game.events.on(FunticoPhaserPlugin.EVENTS.CAMPAIGN_PROGRESS_UPDATED, (progress: any) => {
+  this.progressText.setText(`${progress.TotalStarsEarned} / ${progress.MaxStars} ★`);
+});
+
+await this.funtico.refreshCampaign();                       // fetch + broadcast
+const result = await this.funtico.completeCampaignLevel({   // submit + broadcast
+  time: 47.35,
+  coins: 120
+});
+```
+
+> A successful completion drops the SDK's cached level list automatically — call `GetCampaignLevels` (or `refreshCampaign`) afterwards to render the unlock cascade.
+
+---
+
+## 8. Session Reconnection & Progress Saving
 
 If a player loses connection or reloads their page during a match, you can save their state to allow them to reconnect and resume the match.
 
@@ -342,7 +459,7 @@ console.log(`Session restored! Score: ${savedState.score}, HP: ${savedState.hp}`
 
 ---
 
-## 8. Complete Phaser 3 Scenes Example
+## 9. Complete Phaser 3 Scenes Example
 
 ### BootScene.ts (Initialization and Reconnect Scan)
 ```typescript

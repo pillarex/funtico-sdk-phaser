@@ -11,9 +11,10 @@ For installation and a quick-start integration walkthrough, see [README.md](./RE
 3. [Rooms & Tournament Methods](#rooms--tournament-methods)
 4. [Special Tournaments Methods](#special-tournaments-methods)
 5. [Hall of Fame Methods](#hall-of-fame-methods)
-6. [Client Session Methods (Reconnection)](#client-session-methods-reconnection)
-7. [Phaser Plugin Integration](#phaser-plugin-integration)
-8. [Utilities & Types](#utilities--types)
+6. [Campaign Methods](#campaign-methods)
+7. [Client Session Methods (Reconnection)](#client-session-methods-reconnection)
+8. [Phaser Plugin Integration](#phaser-plugin-integration)
+9. [Utilities & Types](#utilities--types)
 
 ---
 
@@ -1858,6 +1859,436 @@ const placeOf = (place: number) =>
 
 ---
 
+## Campaign Methods
+
+Campaign Mode is a fixed ladder of authored levels the player works through in order. Each level is played in its own **attempt**, scored by a flat set of **metrics** the game reports, and graded server-side into **stars** that gate rewards and unlock the next level. These methods cover the whole loop — checking that a campaign exists, listing levels with the player's progress, starting an attempt, and submitting the finished run.
+
+The typical flow is `IsCampaignAvailable` → `GetCampaignLevels` → `StartCampaignLevel` → *(gameplay)* → `CompleteCampaignLevel` → `GetCampaignLevels` again for the unlock cascade.
+
+> **Casing note:** Campaign responses are **PascalCase** (`IsAvailable`, `BestStars`, `Rewards`), like most of the SDK — and unlike the camelCase Hall of Fame responses documented above.
+
+**Stars are computed server-side.** The client reports metrics; the backend evaluates the level's star rules against them and answers with the stars earned. Render `StarRules` as UI ("finish under 60s for 2 stars"), but never compute stars yourself and never try to submit them — nothing the client sends can claim a star directly.
+
+**The metrics contract.** `CompleteCampaignLevel` takes a flat `name -> value` map (`CampaignMetrics`): 1-32 entries, each name 1-64 characters, each value a **finite number or a boolean**. Booleans are normalized to `1`/`0` for the wire. **Fractional numbers are allowed** — the backend stores metrics as doubles, so `time: 47.35` survives intact, unlike `EndRoomSP`'s `score`, which is an integer and gets truncated. Violations throw a `CampaignError` with `Code: InvalidMetrics` client-side, before anything is encrypted or sent.
+
+**Failure model.** Campaign methods reject with a `CampaignError` carrying a machine-readable `Code` (see the [`CampaignError`](#campaignerror) block at the end of this section) — branch on the code, never on message text. Two outcomes are deliberately *not* errors: a game without a campaign reports `IsAvailable: false` as plain data, and a **lost run resolves normally** with `IsWin: false, Stars: 0`.
+
+**Cache invalidation.** `GetCampaignAvailability` and `GetCampaignLevels` share the SDK-wide cache window (`FunticoConfig.cacheTTL` — see the caching model under [User Data Methods](#user-data-methods)). A successful `CompleteCampaignLevel` drops the cached level list automatically, because completion can unlock the next level server-side — the next `GetCampaignLevels(true)` refetches instead of serving a list where that level still reads `Locked`. It also updates the cached availability's `LevelCount`/`MaxStars` from the completion's own totals.
+
+---
+
+### `GetCampaignAvailability`
+
+Checks whether the game has a campaign configured, and its headline numbers, without fetching the full level list. Call it when building the main menu to decide whether to show the campaign entry at all.
+
+This is the one Campaign method that **works before authentication** — the endpoint is anonymous on the backend and only the game key is required, so even a pre-login menu can gate its campaign button on it. The JWT is attached when one exists, but its absence does not throw, unlike every other Campaign method.
+
+**Signature:**
+```typescript
+public async GetCampaignAvailability(useCache = true): Promise<CampaignAvailabilityViewModel>
+```
+
+**Parameters:**
+- `useCache` - When `true`, returns the cached copy if one exists and the shared TTL window has not expired. When `false`, always issues a `GET /Campaign/availability` request and refreshes the cache. Default: `true`.
+
+**Returns:** `Promise<CampaignAvailabilityViewModel>` - The campaign's headline numbers. **"No campaign" is data, not an error:** the endpoint answers `200` with `IsAvailable: false` for a game without one, so this only rejects on a real failure (network, server error).
+
+**CampaignAvailabilityViewModel Properties:**
+- `IsAvailable` (`boolean`) - Whether the game currently has an active campaign. Gate the campaign menu button on this flag.
+- `LevelCount` (`number`) - How many levels the campaign holds.
+- `MaxStars` (`number`) - The maximum stars obtainable across the whole campaign. Render campaign-wide progress as `TotalStarsEarned` / `MaxStars` once the level list is loaded.
+
+**Usage:**
+```typescript
+const availability = await this.funtico.sdk.GetCampaignAvailability();
+
+this.campaignButton.setVisible(availability.IsAvailable);
+if (availability.IsAvailable) {
+  this.campaignLabel.setText(`Campaign — ${availability.LevelCount} levels`);
+}
+```
+
+---
+
+### `GetCachedCampaignAvailability`
+
+Returns the availability already held in memory, with no network call and no TTL check.
+
+**Signature:**
+```typescript
+public GetCachedCampaignAvailability(): CampaignAvailabilityViewModel | null
+```
+
+**Returns:** `CampaignAvailabilityViewModel | null` - The cached availability, or `null` if `GetCampaignAvailability` has never completed in this session.
+
+**Usage:**
+```typescript
+const availability = this.funtico.sdk.GetCachedCampaignAvailability();
+this.campaignButton.setVisible(availability?.IsAvailable ?? false);
+```
+
+---
+
+### `IsCampaignAvailable`
+
+Convenience shorthand for `(await GetCampaignAvailability(useCache)).IsAvailable`.
+
+**Signature:**
+```typescript
+public async IsCampaignAvailable(useCache = true): Promise<boolean>
+```
+
+**Parameters:**
+- `useCache` - Forwarded to `GetCampaignAvailability`. Default: `true`.
+
+**Returns:** `Promise<boolean>` - Whether the game currently has an active campaign.
+
+**Usage:**
+```typescript
+if (await this.funtico.sdk.IsCampaignAvailable()) {
+  this.scene.start('CampaignMapScene');
+}
+```
+
+---
+
+### `GetCampaignLevels`
+
+Fetches the campaign level list with the player's progress folded in. This is the level-select call.
+
+**Signature:**
+```typescript
+public async GetCampaignLevels(useCache = true): Promise<CampaignLevelsViewModel>
+```
+
+**Parameters:**
+- `useCache` - When `true`, returns the cached copy if one exists and the shared TTL window has not expired. When `false`, always issues a `GET /Campaign/levels` request and refreshes the cache. Note that a successful `CompleteCampaignLevel` drops this cache, so the first `GetCampaignLevels(true)` after a completion refetches regardless. Default: `true`.
+
+**Returns:** `Promise<CampaignLevelsViewModel>` - The full campaign: progress counters plus one entry per level. Always a `200` on the wire — an empty campaign comes back as `IsAvailable: false` with `Levels: []` — so a rejection here is a real failure, not "no campaign".
+
+**CampaignLevelsViewModel Properties:**
+- `IsAvailable` (`boolean`) - Whether the campaign is active. `false` comes with an empty `Levels` array.
+- `TotalLevels` (`number`) - How many levels the campaign holds.
+- `CompletedLevels` (`number`) - How many of them this player has completed.
+- `TotalStarsEarned` (`number`) - The player's stars summed across every level's best result.
+- `MaxStars` (`number`) - The maximum stars obtainable across the whole campaign. Render overall progress as `TotalStarsEarned` / `MaxStars`.
+- `Levels` (`CampaignLevelViewModel[]`) - Every level, in campaign order.
+
+**CampaignLevelViewModel Properties:**
+- `Id` (`string`) - The level's identifier. Pass it to `StartCampaignLevel`.
+- `Order` (`number`) - The level's position in the ladder.
+- `Name` (`string`) - Display name.
+- `Description` (`string | null`, optional) - Longer display description, or `null` when none is configured.
+- `Status` (`CampaignLevelStatus`) - `Locked` (0), `Unlocked` (1) or `Completed` (2). Drives the lock icon; only an `Unlocked` or `Completed` level can be started.
+- `BestStars` (`number`) - The most stars the player has earned on this level. `0` until they win it. Drives the star row on the level card.
+- `BestMetrics` (`Record<string, number> | null`) - The metrics of the player's best run, or `null` when they have none. Use it for "your best: 47.3s" labels.
+- `LevelConfigJson` (`string | null`) - Your game's own level configuration as an opaque JSON string — the SDK renames the wire's `LevelJsonData` onto this. **`null` while the level is `Locked`** (the server withholds it), non-null once unlocked. Parse it with `GetCampaignLevelConfig<T>()`.
+- `StarRules` (`CampaignStarRules | null`) - The level's star thresholds, parsed for you from the wire's JSON string. `null` while the level is `Locked`, and `null` again when the stored rules do not parse — one level's bad rules never reject the whole list. **For display only** — stars are computed server-side.
+- `MinDurationSeconds` (`number`) - The server's minimum plausible clear time. A completion submitted faster than this is rejected with `CompletionTooFast`.
+- `ConfigVersion` (`number`) - Version of the level's configuration. `StartCampaignLevel` echoes the version the attempt was started against.
+- `Rewards` (`CampaignRewardViewModel[]`) - What completing the level can grant, gated per-reward by `RequiredStars`. Empty when the level grants nothing.
+- `CompletedAt` (`string | null`, optional) - ISO-8601 timestamp of the player's first completion, or `null` while the level is uncompleted.
+
+**CampaignLevelStatus Values:**
+- `Locked` (`0`) - Not reachable yet; config and star rules are withheld.
+- `Unlocked` (`1`) - Playable, not yet completed.
+- `Completed` (`2`) - Won at least once; still replayable to improve `BestStars`.
+
+**CampaignStarRules Properties:**
+- `Win` (`CampaignStarRuleCondition[]`) - The conditions a run must meet to count as a win at all.
+- `Stars` (`CampaignStarTier[]`) - One tier per star: `Star` (`number`) plus its `Conditions`.
+
+**CampaignStarRuleCondition Properties:**
+- `Metric` (`string`) - The metric name the condition reads.
+- `Op` (`string`) - The comparison operator, e.g. `">="`.
+- `Value` (`number`) - The threshold.
+
+**CampaignRewardViewModel Properties:**
+- `Type` (`string`) - What kind of reward this is, as the backend names it.
+- `Amount` (`number`) - How many/how much is granted.
+- `ItemId` (`number | null`, optional) - The platform item granted, when the reward is an item.
+- `RequiredStars` (`number`) - Minimum stars the completing run must earn for this reward to be granted.
+- `Name` (`string | null`, optional) - Display name, when configured.
+- `ImageUrl` (`string | null`, optional) - Artwork URL, when configured. Load it with Phaser's own loader.
+
+**Usage:**
+```typescript
+import { CampaignLevelStatus } from './sdk/FunticoPhaserSDK';
+
+const campaign = await this.funtico.sdk.GetCampaignLevels();
+
+if (!campaign.IsAvailable) {
+  this.scene.start('MenuScene');
+  return;
+}
+
+this.progressText.setText(`${campaign.TotalStarsEarned} / ${campaign.MaxStars} ★`);
+
+for (const level of campaign.Levels) {
+  const card = this.createLevelCard(level.Order, level.Name);
+
+  if (level.Status === CampaignLevelStatus.Locked) {
+    card.showLockIcon();          // config and star rules are withheld while locked
+  } else {
+    card.showStars(level.BestStars);
+    card.onClick(() => this.enterLevel(level));
+  }
+}
+```
+
+---
+
+### `GetCachedCampaignLevels`
+
+Returns the level list already held in memory, with no network call and no TTL check. Note that a successful `CompleteCampaignLevel` clears this cache, so right after a completion it returns `null` until `GetCampaignLevels` runs again.
+
+**Signature:**
+```typescript
+public GetCachedCampaignLevels(): CampaignLevelsViewModel | null
+```
+
+**Returns:** `CampaignLevelsViewModel | null` - The cached campaign, or `null` if none is cached.
+
+**Usage:**
+```typescript
+const campaign = this.funtico.sdk.GetCachedCampaignLevels()
+  ?? await this.funtico.sdk.GetCampaignLevels();
+```
+
+---
+
+### `GetCampaignLevelConfig`
+
+Parses a level's opaque config JSON into your game's own type. The schema is **your game's** — the platform stores the string untouched and the SDK never inspects it, so define your own interface and pass it as `T`.
+
+**Signature:**
+```typescript
+public GetCampaignLevelConfig<T = unknown>(level: CampaignLevelViewModel): T
+```
+
+**Parameters:**
+- `level` - The level whose `LevelConfigJson` to parse, from `GetCampaignLevels`.
+
+**Returns:** `T` - The parsed config, cast to your type. Synchronous — no request is made. Throws a plain `Error` (not a `CampaignError`) when the level is still `Locked` (`LevelConfigJson` is `null` — the server withholds it until unlock) or when the stored string is not valid JSON.
+
+**Usage:**
+```typescript
+// The schema is your game's — define your own interface.
+interface MyLevelConfig {
+  enemyWaves: number;
+  timeLimitSeconds: number;
+  tilemapKey: string;
+}
+
+const config = this.funtico.sdk.GetCampaignLevelConfig<MyLevelConfig>(level);
+
+this.scene.start('CampaignGameScene', {
+  levelId: level.Id,
+  waves: config.enemyWaves,
+  timeLimit: config.timeLimitSeconds
+});
+```
+
+---
+
+### `StartCampaignLevel`
+
+Starts an attempt at a level and tracks it as the active attempt. Call it right before gameplay begins — the attempt's `StartedAt` is what `CompletionTooFast` is measured against.
+
+**Signature:**
+```typescript
+public async StartCampaignLevel(levelId: string): Promise<CampaignAttemptData>
+```
+
+**Parameters:**
+- `levelId` - The level's identifier (`CampaignLevelViewModel.Id`). Sent as the `levelId` query value of `POST /Campaign/start-level`.
+
+**Returns:** `Promise<CampaignAttemptData>` - The started attempt. The SDK stores it internally, so `CompleteCampaignLevel` can be called without threading it through your scenes. Rejects with a `CampaignError` — `LevelLocked` when the level is not reachable yet, `LevelNotFound` for an unknown id, `CampaignNotAvailable` when the game has no active campaign.
+
+**Re-starting replaces the tracked attempt.** Calling `StartCampaignLevel` again — for the same level or another — simply makes the new attempt the tracked one; the server abandons the old attempt, and there is nothing to clean up client-side.
+
+**CampaignAttemptData Properties:**
+- `AttemptId` (`string`) - The attempt's identifier. It also seeds the encryption key `CompleteCampaignLevel` derives.
+- `LevelId` (`string`) - The level this attempt belongs to (echoes the request).
+- `ConfigVersion` (`number`) - The level-config version this attempt was started against. If it differs from the `ConfigVersion` you rendered, the level changed under you — refetch before playing.
+- `StartedAt` (`string`) - ISO-8601 timestamp of when the server started the attempt.
+
+**Usage:**
+```typescript
+import { CampaignError, CampaignErrorCode } from './sdk/FunticoPhaserSDK';
+
+try {
+  const attempt = await this.funtico.sdk.StartCampaignLevel(level.Id);
+  console.log(`Attempt ${attempt.AttemptId} started at ${attempt.StartedAt}`);
+  this.scene.start('CampaignGameScene', { level });
+} catch (error) {
+  if (error instanceof CampaignError && error.Code === CampaignErrorCode.LevelLocked) {
+    this.showToast('Complete the previous level first!');
+  } else {
+    throw error;
+  }
+}
+```
+
+---
+
+### `GetActiveCampaignAttempt`
+
+Returns the attempt `StartCampaignLevel` is currently tracking, synchronously and without a request.
+
+**Signature:**
+```typescript
+public GetActiveCampaignAttempt(): CampaignAttemptData | null
+```
+
+**Returns:** `CampaignAttemptData | null` - The tracked attempt, or `null` when none is in flight — before any `StartCampaignLevel`, after a successful `CompleteCampaignLevel`, after `AbandonCampaignAttempt`, or after a completion failed with `AttemptNotFound` or `CompletionTooFast`.
+
+**Usage:**
+```typescript
+const attempt = this.funtico.sdk.GetActiveCampaignAttempt();
+if (attempt) {
+  console.log(`A run of level ${attempt.LevelId} is still in flight`);
+}
+```
+
+---
+
+### `AbandonCampaignAttempt`
+
+Clears the tracked attempt **locally** — no server call is made. There is no abandon endpoint; the server-side attempt simply lapses, or is replaced by the next `StartCampaignLevel`. Call it when the player quits a run without finishing, so a stale attempt cannot be submitted later by mistake.
+
+**Signature:**
+```typescript
+public AbandonCampaignAttempt(): void
+```
+
+**Usage:**
+```typescript
+onQuitToMenu() {
+  this.funtico.sdk.AbandonCampaignAttempt();
+  this.scene.start('CampaignMapScene');
+}
+```
+
+---
+
+### `CompleteCampaignLevel`
+
+Ends a campaign run: validates and normalizes the metrics, encrypts and signs the payload, submits it, and returns the server's graded outcome. Call it once, when the run is over — **whether the player won or lost**.
+
+**Signature:**
+```typescript
+public async CompleteCampaignLevel(metrics: CampaignMetrics, attempt?: CampaignAttemptData): Promise<CampaignCompletionResult>
+```
+
+**Parameters:**
+- `metrics` - Flat `name -> value` map of the run's results (`CampaignMetrics`). 1-32 entries; names 1-64 characters; values finite numbers or booleans. Booleans are sent as `1`/`0`; **fractional numbers pass through untruncated** (the backend stores doubles — this is unlike `EndRoomSP`'s integer score). A violation throws `CampaignError` with `Code: InvalidMetrics` before anything is sent.
+- `attempt` - Optional attempt to submit against, e.g. one you persisted yourself across a reload. Omit it to use the attempt tracked by `StartCampaignLevel`. With neither, the method throws `CampaignError` with `Code: NoActiveAttempt` before any I/O. Completing an explicitly passed attempt never clobbers a **different** attempt the SDK is tracking — tracking is cleared only when it is the same attempt.
+
+**Returns:** `Promise<CampaignCompletionResult>` - The graded outcome. **A loss is a normal resolution** — `IsWin: false, Stars: 0` on a `200` — so render the defeat screen from this same object; only validation and state failures reject.
+
+The SDK encrypts and signs the payload for you (the same scheme as `EndRoomSP`, keyed on the attempt id) — pass plain metrics and never encrypt anything yourself. Events recorded via `RecordEvent_Client` are folded into the encrypted payload automatically.
+
+**Attempt handling on failure:** the tracked attempt is kept only for retryable failures — network errors and `Unknown` — so the game may retry the same submission after a blip. It is cleared for `AttemptNotFound` **and** `CompletionTooFast`: in both cases the server-side attempt is dead (unknown, or abandoned by the too-fast rejection itself), so a retry can never succeed and a fresh `StartCampaignLevel` is needed.
+
+**On success:** the tracked attempt is consumed, the recorded `RecordEvent_Client` log is cleared (the events were delivered in this submission — the client session itself is untouched), the cached level list is dropped (the unlock cascade is server business — refetch `GetCampaignLevels` to render it), and the cached availability's counts are refreshed from the result.
+
+**CampaignCompletionResult Properties:**
+- `IsWin` (`boolean`) - Whether the run met the level's win conditions. `false` is a lost run, not an error.
+- `Stars` (`number`) - Stars this run earned, computed server-side from the level's star rules. `0` on a loss.
+- `BestStars` (`number`) - The player's best star count on this level after this run.
+- `IsNewBest` (`boolean`) - Whether this run improved on the previous best.
+- `LevelCompletedFirstTime` (`boolean`) - `true` only on the first-ever win of this level. Use it to gate one-time celebration UI.
+- `UnlockedLevelId` (`string | null`) - The level this completion unlocked, or `null` when nothing new unlocked.
+- `Rewards` (`CampaignRewardViewModel[]`) - The rewards this completion granted (or would grant), same shape as on the level model.
+- `RewardsGranted` (`boolean`) - Whether the rewards in `Rewards` were actually paid out by this completion.
+- `TotalLevels` / `CompletedLevels` / `TotalStarsEarned` / `MaxStars` (`number`) - The campaign-wide progress counters, updated for this completion — the same fields `GetCampaignLevels` reports, so a progress HUD can rebind from either.
+
+**Usage:**
+```typescript
+import { CampaignError, CampaignErrorCode } from './sdk/FunticoPhaserSDK';
+
+async onRunFinished(timeSeconds: number, coins: number, died: boolean) {
+  try {
+    const result = await this.funtico.sdk.CompleteCampaignLevel({
+      time: timeSeconds,     // fractional is fine - metrics are doubles
+      coins: coins,
+      no_damage: !died       // booleans become 1/0 on the wire
+    });
+
+    if (result.IsWin) {
+      this.showVictory(result.Stars, result.Rewards, result.IsNewBest);
+      if (result.UnlockedLevelId) this.showUnlockBanner(result.UnlockedLevelId);
+    } else {
+      this.showDefeat(); // a loss resolves normally - IsWin false, Stars 0
+    }
+
+    // The level cache was dropped - refetch to render the unlock cascade
+    await this.funtico.sdk.GetCampaignLevels();
+  } catch (error) {
+    if (error instanceof CampaignError && error.Code === CampaignErrorCode.AttemptNotFound) {
+      // The attempt lapsed server-side; tracking is already cleared - start over
+      this.scene.start('CampaignMapScene');
+    } else {
+      throw error;
+    }
+  }
+}
+```
+
+---
+
+### `CampaignError`
+
+The error every Campaign method rejects with, carrying a machine-readable `Code` alongside the human-readable `message`. Branch on `Code` — never on message text, which is free to change.
+
+**Signature:**
+```typescript
+export class CampaignError extends Error {
+  public readonly Code: CampaignErrorCode;
+  constructor(code: CampaignErrorCode, message: string)
+}
+```
+
+**CampaignErrorCode Values:**
+- `CampaignNotAvailable` - The game has no active campaign to serve this request.
+- `LevelLocked` - The level exists but is not reachable yet — the player must complete the one before it.
+- `LevelNotFound` - No level with the given id.
+- `NoActiveAttempt` - **Client-side only.** `CompleteCampaignLevel` was called with no attempt tracked and none passed; nothing was sent.
+- `AttemptNotFound` - The server no longer knows the attempt (lapsed or already consumed). The SDK clears its tracked attempt on this code — start a new attempt.
+- `InvalidSignature` - The encrypted payload failed server-side verification. Almost always a wrong `privateGameKey`.
+- `InvalidMetrics` - The metrics violate the contract. Thrown client-side before any I/O when the SDK can see the violation itself; the same code arrives from the server for violations only it can detect.
+- `CompletionTooFast` - The run finished faster than the level's `MinDurationSeconds` allows. The server abandons the attempt when rejecting it, so the SDK clears its tracked attempt on this code too — start a new attempt.
+- `Unknown` - The response carried no recognisable code (an unparsable body, or an identifier newer than this SDK).
+
+`instanceof CampaignError` is reliable — the constructor restores the prototype chain explicitly — and `error.name` is `'CampaignError'`.
+
+**Usage:**
+```typescript
+import { CampaignError, CampaignErrorCode } from './sdk/FunticoPhaserSDK';
+
+try {
+  await this.funtico.sdk.StartCampaignLevel(level.Id);
+} catch (error) {
+  if (error instanceof CampaignError) {
+    switch (error.Code) {
+      case CampaignErrorCode.LevelLocked:
+        this.showToast('Finish the previous level to unlock this one.');
+        break;
+      case CampaignErrorCode.CampaignNotAvailable:
+        this.scene.start('MenuScene');
+        break;
+      default:
+        console.error(`Campaign failure [${error.Code}]:`, error.message);
+    }
+  } else {
+    throw error; // not a campaign failure - unauthenticated SDK, programming error, ...
+  }
+}
+```
+
+---
+
 ## Client Session Methods (Reconnection)
 
 Use these methods in **client builds** (browser / Telegram Mini App) to make a match survivable across a page reload, a dropped connection, or a browser crash. A client session is a small encrypted blob of your own game state stored server-side alongside the room/tournament identifiers, so that a returning player can be dropped back exactly where they left off.
@@ -2499,6 +2930,70 @@ export class HudScene extends Phaser.Scene {
 
 ---
 
+### `refreshCampaign`
+
+Fetches the campaign level list and broadcasts it, so a level-select or progress Scene can rebind without owning the request. Mirrors `refreshBalance`: the SDK call plus an event.
+
+**Signature:**
+```typescript
+public async refreshCampaign(useCache = false): Promise<CampaignLevelsViewModel>
+```
+
+**Parameters:**
+- `useCache` - Forwarded to `sdk.GetCampaignLevels`. Note the plugin's default differs from the SDK method, which defaults to `true`. Default: `false`.
+
+**Returns:** `Promise<CampaignLevelsViewModel>` - The campaign level list. The same object is passed as the payload of `EVENTS.CAMPAIGN_PROGRESS_UPDATED`. Rejects like `GetCampaignLevels` does (with a `CampaignError`); nothing is emitted on failure.
+
+**Emits:**
+- `EVENTS.CAMPAIGN_PROGRESS_UPDATED` - After the fetch resolves. Payload: the `CampaignLevelsViewModel` object.
+
+**Usage:**
+```typescript
+export class CampaignMapScene extends Phaser.Scene {
+  async create() {
+    // Force a fresh fetch and broadcast it to every listening Scene
+    const campaign = await this.funtico.refreshCampaign();
+    this.renderLevelSelect(campaign.Levels);
+  }
+}
+```
+
+---
+
+### `completeCampaignLevel`
+
+Submits a finished campaign run through the SDK and broadcasts the graded outcome, so result popups and progress HUDs in other Scenes update without being called directly.
+
+**Signature:**
+```typescript
+public async completeCampaignLevel(metrics: CampaignMetrics): Promise<CampaignCompletionResult>
+```
+
+**Parameters:**
+- `metrics` - The run's metrics, forwarded to `sdk.CompleteCampaignLevel`. Same contract: 1-32 entries, names 1-64 chars, finite numbers or booleans, fractional values allowed. The submission runs against the attempt tracked by `StartCampaignLevel` — the plugin wrapper has no `attempt` parameter, so call `sdk.CompleteCampaignLevel(metrics, attempt)` directly when you need to pass one explicitly.
+
+**Returns:** `Promise<CampaignCompletionResult>` - The graded outcome (a loss resolves normally with `IsWin: false`). The same object is passed as the payload of `EVENTS.CAMPAIGN_PROGRESS_UPDATED`. Rejects like `CompleteCampaignLevel` does; nothing is emitted on failure.
+
+**Emits:**
+- `EVENTS.CAMPAIGN_PROGRESS_UPDATED` - After a successful submission. Payload: the `CampaignCompletionResult` object.
+
+**Usage:**
+```typescript
+export class CampaignGameScene extends Phaser.Scene {
+  async onRunFinished() {
+    const result = await this.funtico.completeCampaignLevel({
+      time: this.elapsedSeconds,
+      coins: this.coins,
+      no_damage: !this.tookDamage
+    });
+
+    this.scene.start('CampaignResultScene', { result });
+  }
+}
+```
+
+---
+
 ### `EVENTS`
 
 Static map of the Phaser event keys the plugin emits. Reference these constants instead of hard-coding the raw strings — the constants are part of the SDK's public surface, the string values are an implementation detail.
@@ -2509,7 +3004,8 @@ public static readonly EVENTS = {
   INITIALIZED: 'funtico_initialized',
   AUTHENTICATED: 'funtico_authenticated',
   USER_DATA_UPDATED: 'funtico_user_updated',
-  BALANCE_UPDATED: 'funtico_balance_updated'
+  BALANCE_UPDATED: 'funtico_balance_updated',
+  CAMPAIGN_PROGRESS_UPDATED: 'funtico_campaign_progress_updated'
 }
 ```
 
@@ -2518,6 +3014,7 @@ public static readonly EVENTS = {
 - `AUTHENTICATED` (`'funtico_authenticated'`) - Emitted whenever a JWT has been obtained: by `init()` when `config.userToken` produced a token, and by `login()` after every successful token exchange. **Payload:** `token: string` — the SDK's JWT (`sdk.getUserToken()`), i.e. the game-side token sent in the `Authorization: Bearer` header, not the Funtico platform token. May fire more than once per session if you re-authenticate.
 - `USER_DATA_UPDATED` (`'funtico_user_updated'`) - Emitted by `refreshUserData()` after the profile has been retrieved. **Payload:** `data: UserData` — the same object the method returns (see the `UserData` properties above). Only the plugin wrapper emits it; calling `sdk.GetUserData()` directly fires nothing.
 - `BALANCE_UPDATED` (`'funtico_balance_updated'`) - Emitted by `refreshBalance()` after the balance has been retrieved. **Payload:** `balance: BalanceResponse` — the same object the method returns (see the `BalanceResponse` properties above). Only the plugin wrapper emits it; calling `sdk.GetBalance()` directly fires nothing.
+- `CAMPAIGN_PROGRESS_UPDATED` (`'funtico_campaign_progress_updated'`) - Emitted by both campaign wrappers, with **different payloads**: `refreshCampaign()` emits the `CampaignLevelsViewModel` it fetched, `completeCampaignLevel()` emits the `CampaignCompletionResult` it received. Both carry the shared `CampaignProgressSummary` counters (`TotalLevels`, `CompletedLevels`, `TotalStarsEarned`, `MaxStars`), so a progress HUD can bind to those fields and handle either payload; check for a distinguishing field (e.g. `'Levels' in payload`) before reading anything payload-specific. Only the plugin wrappers emit it; calling `sdk.GetCampaignLevels()` or `sdk.CompleteCampaignLevel()` directly fires nothing.
 
 **Usage:**
 ```typescript
@@ -2563,7 +3060,7 @@ export class ProfileScene extends Phaser.Scene {
 **Important Notes:**
 - Events fire on `game.events`, which lives for the entire lifetime of the `Phaser.Game`. Listeners registered in a Scene's `create()` are **not** removed automatically when that Scene shuts down — remove them on `'shutdown'` or you will accumulate duplicate handlers on every Scene restart.
 - `INITIALIZED` and the first `AUTHENTICATED` are typically emitted during the boot Scene, before other Scenes exist. Use `game.events.once(...)` from the boot Scene, or check `sdk.getUserToken()` / `sdk.GetCachedUserData()` directly in Scenes that start later.
-- Only the four plugin wrapper methods emit events. Direct `this.funtico.sdk.*` calls never touch the event bus, so a Scene that refreshes data through the SDK directly must update its own UI.
+- Only the plugin wrapper methods emit events. Direct `this.funtico.sdk.*` calls never touch the event bus, so a Scene that refreshes data through the SDK directly must update its own UI.
 
 ---
 

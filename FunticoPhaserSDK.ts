@@ -766,6 +766,175 @@ export interface HOFDistributionResponse {
   items: HOFDistributionItem[];
 }
 
+/**
+ * Campaign level lifecycle status. The wire sends it as an int.
+ */
+export enum CampaignLevelStatus {
+  Locked = 0,
+  Unlocked = 1,
+  Completed = 2
+}
+
+/**
+ * Machine-readable codes carried by CampaignError.Code.
+ *
+ * All but two mirror the backend's own error identifiers byte for byte. NoActiveAttempt is
+ * CLIENT-side only - CompleteCampaignLevel throws it before any I/O when there is no attempt to
+ * submit against. Unknown covers any body the SDK cannot parse and any identifier it does not
+ * recognise (e.g. one added by a newer backend).
+ */
+export enum CampaignErrorCode {
+  CampaignNotAvailable = 'CampaignNotAvailable',
+  LevelLocked = 'LevelLocked',
+  LevelNotFound = 'LevelNotFound',
+  NoActiveAttempt = 'NoActiveAttempt',
+  AttemptNotFound = 'AttemptNotFound',
+  InvalidSignature = 'InvalidSignature',
+  InvalidMetrics = 'InvalidMetrics',
+  CompletionTooFast = 'CompletionTooFast',
+  Unknown = 'Unknown'
+}
+
+/**
+ * Error thrown by the Campaign methods, carrying a machine-readable Code alongside the
+ * human-readable message. Branch on `Code`, never on message text.
+ *
+ * `instanceof CampaignError` is reliable: the constructor restores the prototype chain
+ * explicitly, which extending the built-in Error otherwise breaks under ES5-era targets.
+ */
+export class CampaignError extends Error {
+  public readonly Code: CampaignErrorCode;
+
+  constructor(code: CampaignErrorCode, message: string) {
+    super(message);
+    Object.setPrototypeOf(this, CampaignError.prototype);
+    this.name = 'CampaignError';
+    this.Code = code;
+  }
+}
+
+/**
+ * Headline campaign numbers, available without fetching the (heavier) level list.
+ */
+export interface CampaignAvailabilityViewModel {
+  IsAvailable: boolean;
+  LevelCount: number;
+  MaxStars: number;
+}
+
+/**
+ * One reward attached to a campaign level, granted on completing it with at least
+ * `RequiredStars` stars.
+ */
+export interface CampaignRewardViewModel {
+  Type: string;
+  Amount: number;
+  ItemId?: number | null;
+  RequiredStars: number;
+  Name?: string | null;
+  ImageUrl?: string | null;
+}
+
+/**
+ * One condition of a star rule: `Metric` compared via `Op` against `Value`.
+ * FOR DISPLAY ONLY - stars are computed server-side. Render the thresholds; never re-evaluate
+ * them client-side and never submit stars.
+ */
+export interface CampaignStarRuleCondition {
+  Metric: string;
+  Op: string;
+  Value: number;
+}
+
+/** The conditions that must all hold for a run to earn `Star`. */
+export interface CampaignStarTier {
+  Star: number;
+  Conditions: CampaignStarRuleCondition[];
+}
+
+/**
+ * A level's parsed star rules: what counts as a win, and what earns each star.
+ * Parsed client-side from the wire's StarRulesJson; null on the level while it is Locked, and
+ * null again when the stored JSON does not parse.
+ */
+export interface CampaignStarRules {
+  Win: CampaignStarRuleCondition[];
+  Stars: CampaignStarTier[];
+}
+
+/**
+ * One campaign level as the player sees it.
+ *
+ * `LevelConfigJson` is the wire's LevelJsonData under a clearer name: an opaque JSON string
+ * whose schema belongs to YOUR game - parse it via GetCampaignLevelConfig<T>(). Both it and
+ * `StarRules` are null while the level is Locked; the server withholds them until unlock.
+ */
+export interface CampaignLevelViewModel {
+  Id: string;
+  Order: number;
+  Name: string;
+  Description?: string | null;
+  Status: CampaignLevelStatus;
+  BestStars: number;
+  BestMetrics: Record<string, number> | null;
+  LevelConfigJson: string | null;
+  StarRules: CampaignStarRules | null;
+  MinDurationSeconds: number;
+  ConfigVersion: number;
+  Rewards: CampaignRewardViewModel[];
+  CompletedAt?: string | null;
+}
+
+/**
+ * The player's campaign-wide progress counters, shared by the level list and the completion
+ * result so one progress HUD can bind to either.
+ */
+export interface CampaignProgressSummary {
+  TotalLevels: number;
+  CompletedLevels: number;
+  TotalStarsEarned: number;
+  MaxStars: number;
+}
+
+/** The full campaign as returned by GetCampaignLevels. */
+export interface CampaignLevelsViewModel extends CampaignProgressSummary {
+  IsAvailable: boolean;
+  Levels: CampaignLevelViewModel[];
+}
+
+/**
+ * A started level attempt. StartCampaignLevel returns and tracks one; CompleteCampaignLevel
+ * consumes it.
+ */
+export interface CampaignAttemptData {
+  AttemptId: string;
+  LevelId: string;
+  ConfigVersion: number;
+  StartedAt: string;
+}
+
+/**
+ * The metrics a finished run submits: a flat name -> value map.
+ * Booleans are legal and are normalized to 1/0 before encryption. Numbers may be fractional -
+ * the backend stores doubles, so unlike EndRoomSP's int Score nothing is truncated.
+ */
+export type CampaignMetrics = Record<string, number | boolean>;
+
+/**
+ * The outcome of a submitted attempt. Losing is a NORMAL result - IsWin false, Stars 0 - not an
+ * error, so a defeat screen renders from this same object.
+ */
+export interface CampaignCompletionResult extends CampaignProgressSummary {
+  IsWin: boolean;
+  Stars: number;
+  BestStars: number;
+  IsNewBest: boolean;
+  LevelCompletedFirstTime: boolean;
+  UnlockedLevelId: string | null;
+  Rewards: CampaignRewardViewModel[];
+  RewardsGranted: boolean;
+}
+
 /* ============================================================================================
  * WIRE-LEVEL PLUMBING - INTERNAL. NOT PART OF THE PUBLIC API.
  *
@@ -1057,6 +1226,99 @@ interface WireJoinRoomResponse {
   lobby_quote: WireLobbyQuote | null;
 }
 
+/* ---- Campaign wire shapes ----
+ * PROVISIONAL: designed in tandem with the backend (plain PascalCase resolver, enums as ints,
+ * no [JsonProperty]) but NOT yet captured live. Capture each payload from staging before
+ * shipping and stamp the capture date here; if the backend deviates, fix THESE shapes to match
+ * the bytes and absorb the difference in the map* functions.
+ */
+
+/** GET /Campaign/availability - bare, no envelope. Always 200. */
+interface WireCampaignAvailability {
+  IsAvailable: boolean;
+  LevelCount: number;
+  MaxStars: number;
+}
+
+/** One `Rewards` entry on a campaign level or completion response. Nullables arrive as explicit null. */
+interface WireCampaignReward {
+  Type: string;
+  Amount: number;
+  ItemId: number | null;
+  RequiredStars: number;
+  Name: string | null;
+  ImageUrl: string | null;
+}
+
+/** One `Levels` entry on GET /Campaign/levels. Guids are lowercase strings, dates ISO-8601. */
+interface WireCampaignLevel {
+  LevelId: string;
+  Order: number;
+  Name: string;
+  Description: string | null;
+  /** CampaignLevelStatus as an int: 0 Locked / 1 Unlocked / 2 Completed. */
+  Status: number;
+  BestStars: number;
+  BestMetrics: { [k: string]: number } | null;
+  /** Opaque game-defined config JSON string. NULL while the level is Locked. */
+  LevelJsonData: string | null;
+  /** Star rules JSON string. NULL while the level is Locked. */
+  StarRulesJson: string | null;
+  MinDurationSeconds: number;
+  ConfigVersion: number;
+  Rewards: WireCampaignReward[];
+  CompletedAt: string | null;
+}
+
+/**
+ * GET /Campaign/levels - bare, no envelope. Always 200: an empty/unconfigured campaign comes
+ * back as IsAvailable false with Levels [], not as an error status.
+ */
+interface WireCampaignLevelsResponse {
+  IsAvailable: boolean;
+  TotalLevels: number;
+  CompletedLevels: number;
+  TotalStarsEarned: number;
+  MaxStars: number;
+  Levels: WireCampaignLevel[];
+}
+
+/** POST /Campaign/start-level - the 200 body. */
+interface WireCampaignStartResponse {
+  AttemptId: string;
+  LevelId: string;
+  ConfigVersion: number;
+  StartedAt: string;
+}
+
+/**
+ * POST /Campaign/complete-level - the 200 body. A LOSS is a normal 200 here (IsWin false,
+ * Stars 0); only validation/state failures use the error body.
+ */
+interface WireCampaignCompletionResponse {
+  IsWin: boolean;
+  Stars: number;
+  BestStars: number;
+  IsNewBest: boolean;
+  LevelCompletedFirstTime: boolean;
+  UnlockedLevelId: string | null;
+  Rewards: WireCampaignReward[];
+  RewardsGranted: boolean;
+  TotalLevels: number;
+  CompletedLevels: number;
+  TotalStarsEarned: number;
+  MaxStars: number;
+}
+
+/**
+ * The structured error body every /Campaign endpoint uses for non-2xx statuses.
+ * `Error` is a CampaignErrorCode identifier; `Message` is human-readable.
+ */
+interface WireCampaignErrorBody {
+  Error: string;
+  Message: string;
+}
+
 /**
  * Cryptography helper class leveraging the browser Web Crypto API.
  * Ensures complete compatibility with C# AESNonDynamic and HashUtils.
@@ -1188,6 +1450,8 @@ export class FunticoSDK {
   private cachedUserData: UserData | null = null;
   private cachedBalance: BalanceResponse | null = null;
   private cachedVouchers: VoucherData[] | null = null;
+  private cachedCampaignAvailability: CampaignAvailabilityViewModel | null = null;
+  private cachedCampaignLevels: CampaignLevelsViewModel | null = null;
   private cacheExpiresAt: number = 0;
 
   // Raw room configs from the last GetRooms call, kept for GetTierByEventId.
@@ -1199,6 +1463,9 @@ export class FunticoSDK {
   private activeClientSessionId: string | null = null; // Stored eventId
   private currentClientSessionId: string | null = null; // Stored saveSessionId
   private currentClientSessionEvents: string[] = [];
+
+  // Campaign attempt tracking (client-side only; set by StartCampaignLevel)
+  private activeCampaignAttempt: CampaignAttemptData | null = null;
 
   // Dedicated server session tracking
   private activeServerSessionId: string | null = null;
@@ -2341,6 +2608,413 @@ export class FunticoSDK {
     }
   }
 
+  /* ================= Campaign Methods ================= */
+
+  /**
+   * Fetches whether this game has a campaign configured, plus its headline numbers.
+   *
+   * "No campaign" is DATA here, not an error: the endpoint always answers 200 and reports
+   * IsAvailable false for a game without one. Gate the campaign menu button on the flag rather
+   * than wrapping this call in try/catch for that case - a rejection means a real failure.
+   *
+   * Works BEFORE authentication: the endpoint is [AllowAnonymous] on the backend so a pre-login
+   * menu can gate its campaign button - only the game key is required. The JWT is attached when
+   * one exists, but its absence does not throw, unlike every other Campaign method.
+   *
+   * Shares the SDK-wide cache window (FunticoConfig.cacheTTL) with the other cached getters.
+   */
+  public async GetCampaignAvailability(useCache = true): Promise<CampaignAvailabilityViewModel> {
+    if (useCache && this.cachedCampaignAvailability && Date.now() < this.cacheExpiresAt) {
+      return this.cachedCampaignAvailability;
+    }
+
+    // Deliberately NOT getAuthHeaders: that helper throws with no JWT, and no-JWT is exactly
+    // the pre-login state this endpoint exists to serve.
+    const headers: Record<string, string> = { "X-User-Key": this.config.publicGameKey };
+    if (this.jwtToken) {
+      headers["Authorization"] = `Bearer ${this.jwtToken}`;
+    }
+
+    const response = await fetch(`${this.apiUri}/Campaign/availability`, {
+      headers
+    });
+    if (!response.ok) await this.throwCampaignError(response, "Failed to fetch campaign availability");
+
+    const wire: WireCampaignAvailability = await response.json();
+    const availability = this.mapCampaignAvailability(wire);
+    this.cachedCampaignAvailability = availability;
+    this.updateCacheExpiration();
+    return availability;
+  }
+
+  /** Returns the availability already held in memory - no network call, no TTL check. */
+  public GetCachedCampaignAvailability(): CampaignAvailabilityViewModel | null {
+    return this.cachedCampaignAvailability;
+  }
+
+  /** Convenience shorthand for `(await GetCampaignAvailability(useCache)).IsAvailable`. */
+  public async IsCampaignAvailable(useCache = true): Promise<boolean> {
+    return (await this.GetCampaignAvailability(useCache)).IsAvailable;
+  }
+
+  /**
+   * Fetches the campaign level list with the player's progress folded in.
+   *
+   * Always a 200 on the wire - an empty campaign comes back as IsAvailable false with Levels []
+   * - so a rejection here is a real failure, not "no campaign". A Locked level arrives with its
+   * LevelConfigJson and StarRules deliberately withheld (null); render it as a lock icon from
+   * Status and BestStars alone.
+   *
+   * The cached copy is dropped automatically by a successful CompleteCampaignLevel, because a
+   * completion can unlock the next level server-side - refetch after completing to render the
+   * unlock cascade.
+   */
+  public async GetCampaignLevels(useCache = true): Promise<CampaignLevelsViewModel> {
+    if (useCache && this.cachedCampaignLevels && Date.now() < this.cacheExpiresAt) {
+      return this.cachedCampaignLevels;
+    }
+
+    const response = await fetch(`${this.apiUri}/Campaign/levels`, {
+      headers: this.getAuthHeaders(false)
+    });
+    if (!response.ok) await this.throwCampaignError(response, "Failed to fetch campaign levels");
+
+    const wire: WireCampaignLevelsResponse = await response.json();
+    const levels: CampaignLevelsViewModel = {
+      IsAvailable: wire.IsAvailable,
+      TotalLevels: wire.TotalLevels,
+      CompletedLevels: wire.CompletedLevels,
+      TotalStarsEarned: wire.TotalStarsEarned,
+      MaxStars: wire.MaxStars,
+      Levels: (wire.Levels ?? []).map(level => this.mapCampaignLevel(level))
+    };
+    this.cachedCampaignLevels = levels;
+    this.updateCacheExpiration();
+    return levels;
+  }
+
+  /** Returns the level list already held in memory - no network call, no TTL check. */
+  public GetCachedCampaignLevels(): CampaignLevelsViewModel | null {
+    return this.cachedCampaignLevels;
+  }
+
+  /**
+   * Parses a level's opaque config JSON into your game's own type.
+   *
+   * The schema is YOUR game's - the platform stores the string untouched and the SDK never
+   * inspects it, so define your own interface and pass it as T. Throws a plain Error when the
+   * level is still Locked (the server withholds the config until unlock) or when the stored
+   * string is not valid JSON.
+   */
+  public GetCampaignLevelConfig<T = unknown>(level: CampaignLevelViewModel): T {
+    if (level.LevelConfigJson === null) {
+      throw new Error(
+        `Campaign level "${level.Name}" has no config to parse - it is still locked, so the server withheld LevelConfigJson.`
+      );
+    }
+    try {
+      return JSON.parse(level.LevelConfigJson) as T;
+    } catch {
+      throw new Error(`Campaign level "${level.Name}" carries a config that is not valid JSON.`);
+    }
+  }
+
+  /**
+   * Starts an attempt at a level and tracks it as THE active attempt.
+   *
+   * Re-starting - the same level or another - simply replaces the tracked attempt: the server
+   * abandons the old one, so there is nothing to clean up client-side. Rejects with a
+   * CampaignError (LevelLocked, LevelNotFound, CampaignNotAvailable) when the level cannot be
+   * started.
+   */
+  public async StartCampaignLevel(levelId: string): Promise<CampaignAttemptData> {
+    const response = await fetch(`${this.apiUri}/Campaign/start-level?levelId=${levelId}`, {
+      method: "POST",
+      headers: this.getAuthHeaders(false)
+    });
+    if (!response.ok) await this.throwCampaignError(response, "Failed to start campaign level");
+
+    const wire: WireCampaignStartResponse = await response.json();
+    const attempt: CampaignAttemptData = {
+      AttemptId: wire.AttemptId,
+      LevelId: wire.LevelId,
+      ConfigVersion: wire.ConfigVersion,
+      StartedAt: wire.StartedAt
+    };
+    this.activeCampaignAttempt = attempt;
+    return attempt;
+  }
+
+  /** The attempt StartCampaignLevel is currently tracking, or null when none is in flight. */
+  public GetActiveCampaignAttempt(): CampaignAttemptData | null {
+    return this.activeCampaignAttempt;
+  }
+
+  /**
+   * Clears the tracked attempt LOCALLY - no server call. There is no abandon endpoint; the
+   * server-side attempt simply lapses, or is replaced by the next StartCampaignLevel.
+   */
+  public AbandonCampaignAttempt(): void {
+    this.activeCampaignAttempt = null;
+  }
+
+  /**
+   * Submits a finished run's metrics, encrypted and signed, and returns the graded outcome.
+   *
+   * Losing is a NORMAL resolution (IsWin false, Stars 0), not a rejection - render the defeat
+   * screen from the returned result. Stars are computed SERVER-side from the level's star
+   * rules; nothing the client sends can claim them directly.
+   *
+   * Metrics are validated and normalized BEFORE anything is encrypted (violations throw a
+   * CampaignError with Code InvalidMetrics client-side): 1-32 entries, each name 1-64 chars,
+   * each value a finite number or a boolean. Booleans become 1/0; numbers pass through
+   * UNTRUNCATED - the backend stores doubles, so fractional values are legal, unlike
+   * EndRoomSP's int Score.
+   *
+   * Events recorded via RecordEvent_Client are folded into the encrypted payload, the same way
+   * EndRoomSP folds them into a room score; the log is reset once a submission delivers them.
+   *
+   * On failure the tracked attempt survives only for retryable failures (network, Unknown).
+   * AttemptNotFound and CompletionTooFast both leave the server-side attempt dead - unknown,
+   * or abandoned by the too-fast rejection itself - so a retry can never succeed and tracking
+   * is cleared before rethrowing. On success the attempt is consumed and the cached level list
+   * is dropped: the unlock cascade is server business, so the next GetCampaignLevels refetches.
+   *
+   * @param attempt Submit against this attempt instead of the tracked one - e.g. one restored
+   *                from your own storage after a reload. Omit it to use the attempt
+   *                StartCampaignLevel tracked; with neither, throws CampaignError with Code
+   *                NoActiveAttempt before any I/O. Completing a passed attempt never clobbers
+   *                a DIFFERENT attempt the SDK is tracking.
+   */
+  public async CompleteCampaignLevel(metrics: CampaignMetrics, attempt?: CampaignAttemptData): Promise<CampaignCompletionResult> {
+    const activeAttempt = attempt ?? this.activeCampaignAttempt;
+    if (!activeAttempt) {
+      throw new CampaignError(
+        CampaignErrorCode.NoActiveAttempt,
+        "No active campaign attempt to complete. Call StartCampaignLevel first, or pass the attempt explicitly."
+      );
+    }
+
+    const normalizedMetrics = this.normalizeCampaignMetrics(metrics);
+
+    // Mirrors EndRoomSP's scheme exactly, with the attempt id standing in for
+    // sessionOrMatchId: AES key = first 8 of the attempt id + first 8 of the private key;
+    // HMAC over the BASE64 ciphertext with the private key from character 8.
+    const plainText = JSON.stringify({
+      AttemptId: activeAttempt.AttemptId,
+      LevelId: activeAttempt.LevelId,
+      Metrics: normalizedMetrics,
+      GameEvents: this.currentClientSessionEvents
+    });
+    const encryptionKey = activeAttempt.AttemptId.substring(0, 8) + this.config.privateGameKey.substring(0, 8);
+    const encryptedData = await CryptoHelper.encrypt(plainText, encryptionKey);
+
+    const hashKey = this.config.privateGameKey.substring(8);
+    const hash = await CryptoHelper.hmacSha256(encryptedData, hashKey);
+
+    const response = await fetch(`${this.apiUri}/Campaign/complete-level`, {
+      method: "POST",
+      headers: this.getAuthHeaders(true),
+      body: JSON.stringify({
+        AttemptId: activeAttempt.AttemptId,
+        EncryptedData: encryptedData,
+        Hash: hash
+      })
+    });
+
+    if (!response.ok) {
+      try {
+        await this.throwCampaignError(response, "Failed to complete campaign level");
+      } catch (error) {
+        // AttemptNotFound and CompletionTooFast both mean the server-side attempt is dead
+        // (unknown, or abandoned by the too-fast rejection itself), so a retry can never
+        // succeed - stop tracking it. Only OUR tracked attempt though: completing an
+        // explicitly passed attempt must not clobber a different tracked one. Network and
+        // Unknown failures keep the attempt so the game may retry.
+        const attemptIsDead = error instanceof CampaignError &&
+          (error.Code === CampaignErrorCode.AttemptNotFound ||
+            error.Code === CampaignErrorCode.CompletionTooFast);
+        if (attemptIsDead && this.activeCampaignAttempt?.AttemptId === activeAttempt.AttemptId) {
+          this.activeCampaignAttempt = null;
+        }
+        throw error;
+      }
+    }
+
+    const wire: WireCampaignCompletionResponse = await response.json();
+    const result = this.mapCampaignCompletion(wire);
+
+    // Clear tracking only when the completed attempt IS the tracked one - completing an
+    // explicitly passed attempt must not clobber a different tracked attempt.
+    if (this.activeCampaignAttempt?.AttemptId === activeAttempt.AttemptId) {
+      this.activeCampaignAttempt = null;
+    }
+    // events were delivered in this submission; the client session itself is untouched
+    this.currentClientSessionEvents = [];
+    // The unlock cascade happened server-side; a stale list would keep the next level rendered
+    // as Locked, so the cache is dropped rather than patched.
+    this.cachedCampaignLevels = null;
+    if (this.cachedCampaignAvailability) {
+      this.cachedCampaignAvailability.LevelCount = result.TotalLevels;
+      this.cachedCampaignAvailability.MaxStars = result.MaxStars;
+    }
+    this.updateCacheExpiration();
+
+    return result;
+  }
+
+  /**
+   * Validates the metrics contract and normalizes values for the wire.
+   * Throws CLIENT-side with the same InvalidMetrics code the server would answer with, so a
+   * game handles both origins through one branch.
+   */
+  private normalizeCampaignMetrics(metrics: CampaignMetrics): Record<string, number> {
+    const entries = Object.entries(metrics ?? {});
+    if (entries.length < 1 || entries.length > 32) {
+      throw new CampaignError(
+        CampaignErrorCode.InvalidMetrics,
+        `Campaign metrics must carry 1-32 entries; got ${entries.length}`
+      );
+    }
+
+    const normalized: Record<string, number> = {};
+    for (const [name, value] of entries) {
+      if (name.length < 1 || name.length > 64) {
+        throw new CampaignError(
+          CampaignErrorCode.InvalidMetrics,
+          `Campaign metric name "${name}" must be 1-64 characters`
+        );
+      }
+      if (typeof value === 'boolean') {
+        normalized[name] = value ? 1 : 0;
+      } else if (typeof value === 'number' && Number.isFinite(value)) {
+        // Deliberately NOT truncated: the backend field is a double, so fractional metrics are
+        // legal - this is the one score-like payload where Math.trunc would corrupt data.
+        normalized[name] = value;
+      } else {
+        throw new CampaignError(
+          CampaignErrorCode.InvalidMetrics,
+          `Campaign metric "${name}" must be a finite number or a boolean`
+        );
+      }
+    }
+    return normalized;
+  }
+
+  /**
+   * Reads a non-2xx Campaign response and throws the matching CampaignError.
+   * The body contract is {Error, Message}; an unrecognised identifier or an unparsable body
+   * maps to CampaignErrorCode.Unknown with whatever text was readable.
+   */
+  private async throwCampaignError(response: Response, fallback: string): Promise<never> {
+    const text = await response.text();
+    let code = CampaignErrorCode.Unknown;
+    let message = text || `HTTP ${response.status}`;
+
+    try {
+      const parsed: WireCampaignErrorBody | null = JSON.parse(text);
+      if (parsed && typeof parsed.Error === 'string' &&
+        (Object.values(CampaignErrorCode) as string[]).includes(parsed.Error)) {
+        code = parsed.Error as CampaignErrorCode;
+      }
+      if (parsed && typeof parsed.Message === 'string') {
+        message = parsed.Message;
+      }
+    } catch {
+      // Not a JSON body - keep the raw text under the Unknown code.
+    }
+
+    throw new CampaignError(code, `${fallback}: ${message}`);
+  }
+
+  private mapCampaignAvailability(wire: WireCampaignAvailability): CampaignAvailabilityViewModel {
+    return {
+      IsAvailable: wire.IsAvailable,
+      LevelCount: wire.LevelCount,
+      MaxStars: wire.MaxStars
+    };
+  }
+
+  /**
+   * Composes the public level model from the wire shape.
+   * LevelJsonData is renamed onto LevelConfigJson, and StarRulesJson is PARSED into StarRules -
+   * with a try/catch, so one level's garbage rules cannot kill the whole list.
+   */
+  private mapCampaignLevel(wire: WireCampaignLevel): CampaignLevelViewModel {
+    return {
+      Id: wire.LevelId,
+      Order: wire.Order,
+      Name: wire.Name,
+      Description: wire.Description,
+      Status: this.mapCampaignLevelStatus(wire.Status),
+      BestStars: wire.BestStars,
+      BestMetrics: wire.BestMetrics,
+      LevelConfigJson: wire.LevelJsonData,
+      StarRules: this.parseCampaignStarRules(wire.StarRulesJson),
+      MinDurationSeconds: wire.MinDurationSeconds,
+      ConfigVersion: wire.ConfigVersion,
+      Rewards: (wire.Rewards ?? []).map(reward => this.mapCampaignReward(reward)),
+      CompletedAt: wire.CompletedAt
+    };
+  }
+
+  /** Strict on purpose: an unknown status int is a contract break, not something to default. */
+  private mapCampaignLevelStatus(status: number): CampaignLevelStatus {
+    switch (status) {
+      case 0:
+        return CampaignLevelStatus.Locked;
+      case 1:
+        return CampaignLevelStatus.Unlocked;
+      case 2:
+        return CampaignLevelStatus.Completed;
+      default:
+        throw new Error(`Unknown campaign level status: ${status}`);
+    }
+  }
+
+  /** Null in, null out - and null on garbage too: locked levels and bad JSON both render ruleless. */
+  private parseCampaignStarRules(json: string | null): CampaignStarRules | null {
+    if (json === null) return null;
+    try {
+      const parsed = JSON.parse(json);
+      if (parsed === null || typeof parsed !== 'object') return null;
+      return {
+        Win: Array.isArray(parsed.Win) ? parsed.Win : [],
+        Stars: Array.isArray(parsed.Stars) ? parsed.Stars : []
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private mapCampaignReward(wire: WireCampaignReward): CampaignRewardViewModel {
+    return {
+      Type: wire.Type,
+      Amount: wire.Amount,
+      ItemId: wire.ItemId,
+      RequiredStars: wire.RequiredStars,
+      Name: wire.Name,
+      ImageUrl: wire.ImageUrl
+    };
+  }
+
+  private mapCampaignCompletion(wire: WireCampaignCompletionResponse): CampaignCompletionResult {
+    return {
+      IsWin: wire.IsWin,
+      Stars: wire.Stars,
+      BestStars: wire.BestStars,
+      IsNewBest: wire.IsNewBest,
+      LevelCompletedFirstTime: wire.LevelCompletedFirstTime,
+      UnlockedLevelId: wire.UnlockedLevelId,
+      Rewards: (wire.Rewards ?? []).map(reward => this.mapCampaignReward(reward)),
+      RewardsGranted: wire.RewardsGranted,
+      TotalLevels: wire.TotalLevels,
+      CompletedLevels: wire.CompletedLevels,
+      TotalStarsEarned: wire.TotalStarsEarned,
+      MaxStars: wire.MaxStars
+    };
+  }
+
   /* ================= Client Session Methods (Reconnection) ================= */
 
   public async UserHasUnfinishedSession_Client(): Promise<UnfinishedSessionsResponse> {
@@ -2591,7 +3265,8 @@ export class FunticoPhaserPlugin extends Phaser.Plugins.BasePlugin {
     INITIALIZED: 'funtico_initialized',
     AUTHENTICATED: 'funtico_authenticated',
     USER_DATA_UPDATED: 'funtico_user_updated',
-    BALANCE_UPDATED: 'funtico_balance_updated'
+    BALANCE_UPDATED: 'funtico_balance_updated',
+    CAMPAIGN_PROGRESS_UPDATED: 'funtico_campaign_progress_updated'
   };
 
   constructor(pluginManager: Phaser.Plugins.PluginManager) {
@@ -2631,5 +3306,25 @@ export class FunticoPhaserPlugin extends Phaser.Plugins.BasePlugin {
     const balance = await this.sdk.GetBalance(useCache);
     this.game.events.emit(FunticoPhaserPlugin.EVENTS.BALANCE_UPDATED, balance);
     return balance;
+  }
+
+  /**
+   * Fetches the campaign level list and broadcasts it, so a level-select Scene can rebind
+   * without owning the request. Note the event payload differs from completeCampaignLevel's:
+   * this emits the CampaignLevelsViewModel, that emits the CampaignCompletionResult.
+   */
+  public async refreshCampaign(useCache = false): Promise<CampaignLevelsViewModel> {
+    const campaign = await this.sdk.GetCampaignLevels(useCache);
+    this.game.events.emit(FunticoPhaserPlugin.EVENTS.CAMPAIGN_PROGRESS_UPDATED, campaign);
+    return campaign;
+  }
+
+  /**
+   * Submits a finished campaign run through the SDK and broadcasts the graded outcome.
+   */
+  public async completeCampaignLevel(metrics: CampaignMetrics): Promise<CampaignCompletionResult> {
+    const result = await this.sdk.CompleteCampaignLevel(metrics);
+    this.game.events.emit(FunticoPhaserPlugin.EVENTS.CAMPAIGN_PROGRESS_UPDATED, result);
+    return result;
   }
 }
