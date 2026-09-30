@@ -34,10 +34,9 @@ export enum RoomTier {
 /**
  * Lifecycle of a room's prize settlement, as reported by `state` on GET /Rooms/leaders.
  *
- * Values verified against the backend enum (DTO/Rooms/RoomLeadersResponse.cs `LeadersState`),
- * not merely copied from Unity: `placed = 0, distributed = 1, to_be_returned = 3, returned = 4`.
- * 2 is genuinely skipped there - it is NOT a transcription slip, so do not "fix" the gap.
- * The backing field is a plain `int` with no StringEnumConverter, so the wire carries the number.
+ * Values match the wire exactly: `placed = 0, distributed = 1, to_be_returned = 3, returned = 4`.
+ * 2 is intentionally unused - it is NOT a transcription slip, so do not "fix" the gap.
+ * The response carries the number, not the name.
  */
 export enum LeadersState {
   /** Scores are in, prizes not settled yet. Drives IsPending. */
@@ -52,7 +51,7 @@ export enum LeadersState {
  *
  * NOT the same enum as EntryFeeType, despite both having a `Free` member: this one is Free = 0,
  * EntryFeeType is Free = 5. Comparing a ticket type against EntryFeeType.Free would classify every
- * room as not-free. Mirrors Unity's APIModels.TicketType.
+ * room as not-free.
  */
 enum TicketType {
   Free = 0,
@@ -109,7 +108,7 @@ export enum HallOfFameGameModeFilter {
 }
 
 /**
- * Backend `gameMode` query values for the /HallOfFame endpoints.
+ * Wire `gameMode` query values for the /HallOfFame endpoints.
  * Deliberately offset by one from HallOfFameGameModeFilter, which has no `All` equivalent.
  * Wire-level detail - prefer HallOfFameGameModeFilter.
  */
@@ -120,7 +119,7 @@ export enum HallOfFameGameMode {
 }
 
 /**
- * Prize types mapped directly to the Funtico backend enum.
+ * Prize types, as they appear in the `type` field of prize objects.
  */
 export enum PrizeType {
   Item = 'Item',
@@ -215,17 +214,12 @@ export interface GppAutomatedPrize extends BasePrize {
  * Discriminated union of all Funtico Prize variations.
  *
  * THE MIXED CASING IS CORRECT - DO NOT "FIX" IT.
- * These objects are written by the backend's PrizeConverter, which does NOT use the normal
- * serializer path. `PrizeConverter.WriteJson` hardcodes a lowercase `type` key, then walks the
- * concrete prize's C# properties by reflection and writes each one under `prop.Name` - the raw
- * property name - ignoring the `[JsonProperty("snake_case")]` attribute declared on it. So `Value`,
- * `Currency`, `PrizeId`, `Amount`, `ImageUrl` etc. all arrive PascalCase even though the C# model
- * says otherwise. The nested `Item` is the one exception: it is emitted via `JToken.FromObject`,
- * which runs the standard serializer and therefore DOES honour `[JsonProperty]`, keeping
- * `PlatformItemPrize` lowercase (id/image/name).
- * The converter also omits null-valued properties entirely, hence the optional markers.
+ * Prize objects arrive with a lowercase `type` key and every other field in PascalCase: `Value`,
+ * `Currency`, `PrizeId`, `Amount`, `ImageUrl` etc. The nested `Item` is the one exception and stays
+ * lowercase (`PlatformItemPrize`: id/image/name).
+ * Null-valued fields are omitted entirely, hence the optional markers.
  *
- * Proven live on 2026-07-15 via `room.prize_distribution[].prizes[]`:
+ * Example, from `room.prize_distribution[].prizes[]`:
  *   {"type":"DepositStakePerPlayer","Currency":1,"Value":750}
  *   {"type":"Reward","PrizeId":2521,"Amount":1,"Item":{"id":2521,"image":"...","name":"Gift Box"}}
  */
@@ -237,7 +231,7 @@ export type Prize =
   | GppAutomatedPrize;
 
 /**
- * Port of C# PrizeUtils to JS/TS.
+ * Helpers for computing the value of a prize list.
  */
 export class PrizeUtils {
   /**
@@ -276,11 +270,7 @@ export class PrizeUtils {
         // GameManagedReward is deliberately absent and MUST stay absent - it contributes 0.
         // Such a prize is granted by the game itself, not paid out of the deposit stake, so
         // counting its Value here would inflate YourTicoEarnings (and Multiplier with it) by an
-        // amount the platform never pays. Both C# references agree and neither has an arm for it:
-        // the backend's DTO/Rooms/PrizesResponses/Prize.cs PrizeUtils.CalculatePrize and Unity's
-        // APIModels/PrizesResponses/Prize.cs:115-135 both let it fall through to the default and
-        // return 0. The backend even models it as its own class (GameManagedPrize : Prize), not as
-        // a GppAutomatedPrize. Do not "restore" this case for symmetry with GppPerPlayer.
+        // amount the platform never pays. Do not "restore" this case for symmetry with GppPerPlayer.
       }
     }
 
@@ -301,7 +291,7 @@ export interface FunticoConfig {
    * Custom URL for the Funtico PLATFORM API (the host serving /api/v1/web/users).
    * This is a different host from apiBaseUrl: apiBaseUrl is the game's Rooms API and takes the
    * game JWT, while this one is the platform itself and takes the user's platform token.
-   * Defaults from `env`, mirroring Unity's APIConstants.
+   * Defaults from `env`.
    */
   funticoApiBaseUrl?: string;
   cacheTTL?: number;           // Cache lifetime in milliseconds (default: 30000ms)
@@ -360,8 +350,7 @@ export interface TierViewModel {
   TierName: string;
   Tier: RoomTier;
   /**
-   * Raw tier icon URL. Unity resolves this to a Sprite via its asset loader; the Phaser SDK has no
-   * asset loader, so the URL is handed to the game as-is.
+   * Raw tier icon URL. The SDK does not load it; the URL is handed to the game as-is.
    */
   TierImage: string;
   EntryFeeLowerBound: number;
@@ -404,9 +393,8 @@ export interface PrizePlaceViewModel {
 /**
  * A room's full prize pool breakdown.
  *
- * There is no endpoint behind this - Unity composes it entirely client-side from the room config
- * (RoomsProviderInternal.GetPrizePoolDistribution). TicoPerPlayer and TotalTicoDistributedToPlayers
- * are computed getters in Unity; here they are resolved at mapping time.
+ * There is no endpoint behind this - the SDK composes it entirely client-side from the room config.
+ * TicoPerPlayer and TotalTicoDistributedToPlayers are resolved at mapping time.
  */
 export interface PrizePoolDistributionViewModel {
   PrizePlaces: PrizePlaceViewModel[];
@@ -422,12 +410,10 @@ export interface PrizePoolDistributionViewModel {
 /**
  * One entry of GET /Rooms/pre-paid: a room the user has already paid the entry fee for.
  *
- * Snake_case, unlike the other public models, because this is a straight passthrough - Unity does
- * not compose a ViewModel from it either (RoomsProviderInternal.GetPrePaidRooms returns the raw
- * response), and GetRooms only ever reads `id` off it to set RoomViewModel.IsPrePaid.
+ * Snake_case, unlike the other public models, because this is a straight passthrough of the
+ * response; GetRooms only ever reads `id` off it to set RoomViewModel.IsPrePaid.
  *
- * Captured live on 2026-07-15 with a non-empty array (an earlier capture caught it empty, which is
- * why only `id` was modelled before):
+ * Example entry:
  *   {"id":"ca1ef3b9-...","attempts_left":1,"participation_id":"192da493-...",
  *    "game_session_id":"4be2ab2a-...","community_id":null,"voucher_used":false}
  */
@@ -467,16 +453,10 @@ export interface LeaderboardItemViewModel {
  */
 export interface RoomLeaderboardViewModel {
   /**
-   * Was declared `string` while this method returned the raw wire, but the wire sends the
-   * LeadersState number and nothing ever produced a string here - the field read `undefined` on
-   * every call, so no working consumer can depend on the old type. Changed to the enum rather
-   * than mapping the number to its member name, because:
-   *   - it matches Unity's own `public LeadersState State`, which this is a port of;
-   *   - it matches this very interface's `RoomTier: RoomTier`, the SDK's convention for
-   *     ViewModel enums (mapping to a name would make State the odd one out);
-   *   - `State === LeadersState.placed` is checkable, `State === "placed"` is a magic string;
-   *   - the enum's numbers are the wire's numbers, so parsing stays lossless.
-   * Log-friendliness is the one thing lost: `LeadersState[view.State]` gives the name back.
+   * The room's settlement state as the numeric LeadersState value (the response sends the number).
+   * Earlier SDK versions declared this as `string`, but it never held a value, so no working
+   * consumer can depend on the old type. Compare with `State === LeadersState.placed`; for logging,
+   * `LeadersState[view.State]` gives the member name.
    */
   State: LeadersState;
   IsPending: boolean;
@@ -494,18 +474,17 @@ export interface RoomLeaderboardViewModel {
  * Special Tournament ViewModel.
  *
  * Unlike the Rooms models, this one needs no mapping layer: the tournament endpoints already
- * serialize PascalCase and the field names below match the wire as-is. The single exception is the
- * identifier - the wire calls it `Plaftorfm_Guid` (the typo is the backend's) and also sends an
- * unrelated `Id` that is always 0. The SDK aliases the guid onto both `Id` and `Guid` so that
- * `Id` is the value every other tournament method actually accepts. Unity does the same remap,
- * exposing it as `Guid` only.
+ * return PascalCase and the field names below match the wire as-is. The single exception is the
+ * identifier - the wire calls it `Plaftorfm_Guid` (sic - that is the real field name) and also sends
+ * an unrelated `Id` that is always 0. The SDK aliases the guid onto both `Id` and `Guid` so that
+ * `Id` is the value every other tournament method actually accepts.
  *
  * Every wire field is preserved on the returned object, so anything the platform adds later is
  * still reachable even if it is not declared here.
  */
 export interface TournamentViewModel {
   Id: string;                 // Aliased from Plaftorfm_Guid. Pass THIS to the other tournament methods.
-  Guid: string;               // Same value as Id; mirrors the Unity SDK's field name.
+  Guid: string;               // Same value as Id; alternative name.
   Plaftorfm_Guid: string;     // The raw wire field, kept as-is.
   Name: string;
   Description?: string;
@@ -535,7 +514,7 @@ export interface TournamentViewModel {
   SpecialTournamentsType?: number;
 
   // --- Declared by earlier SDK versions but NOT sent by the API. Always undefined. ---
-  // Kept optional so existing integrations still compile. The Unity SDK has no equivalents either.
+  // Kept optional so existing integrations still compile.
   // Use StartDate/EndDate instead of StartsAt/EndsAt, and EntryLimit instead of MaxEntries.
   GameId?: number;
   MapId?: number;
@@ -592,8 +571,8 @@ export interface TournamentCommunityViewModel {
  * Special Tournament Enter Response.
  *
  * IMPORTANT: `TournamentScoreUuid` is the `saveScoreId` to pass to ResultTournament_Client /
- * ResultTournament_Server. `LocalTournamentUUID` is only the SDK-side TournamentSaveDatas row id;
- * the platform rejects it with 400 "The selected tournament score uuid is invalid."
+ * ResultTournament_Server. `LocalTournamentUUID` is a different, internal identifier and NOT a
+ * saveScoreId; the platform rejects it with 400 "The selected tournament score uuid is invalid."
  */
 export interface TournamentEnterData {
   TournamentScoreUuid: string;   // The saveScoreId. This is the one you want.
@@ -616,7 +595,7 @@ export interface TournamentResultViewModel {
  */
 export interface TournamentPrizeItemViewModel {
   Name: string;
-  Description: string | null;  // Always null - the backend never populates it
+  Description: string | null;  // Always null - not populated; do not rely on it
   ImageUrl: string;
   Amount: number;
   Value_usd: number | null;    // Underscore casing is the real wire field name
@@ -636,7 +615,6 @@ export interface TournamentPrizePlaceViewModel {
 
 /**
  * Tournament prize table. Note the root is an object wrapping the list, not a bare array.
- * Mirrors the Unity SDK's TournamentPrizesViewModel.
  */
 export interface TournamentPrizesViewModel {
   Prizes: TournamentPrizePlaceViewModel[];
@@ -646,9 +624,8 @@ export interface TournamentPrizesViewModel {
  * Historical Tournament entry data.
  *
  * The tournament-history endpoint is the one tournament response that is snake_case on the wire
- * (`tournament_name`, `best_score`, ...). Unity gets the rename for free from [JsonProperty]
- * attributes; TypeScript has no such mechanism, so the SDK aliases each field to the PascalCase
- * name below. The raw snake_case keys are preserved on the returned objects too.
+ * (`tournament_name`, `best_score`, ...). The SDK aliases each field to the PascalCase name below.
+ * The raw snake_case keys are preserved on the returned objects too.
  */
 export interface TournamentHistoryPrize {
   Name: string;
@@ -708,15 +685,14 @@ export interface UnfinishedSessionsResponse {
 export interface ServerUserData {
   JoinKey: string;
   FunticoUserId: number;  // Platform user ID
-  SdkUserId: number;      // Database user ID
+  SdkUserId: number;      // Game API user ID
   UserStatus: UserGameStatus;
 }
 
 /**
  * Hall of Fame leaderboard entry.
  *
- * Fields are camelCase, unlike the rest of this SDK: the /HallOfFame DTOs declare explicit
- * lowercase [JsonProperty] names, which win over the PascalCase resolver the other endpoints use.
+ * Fields are camelCase, unlike the rest of this SDK: that is how the /HallOfFame endpoints send them.
  * Do not "fix" these to PascalCase for consistency - every field would silently read undefined.
  * Nullable fields are sent as explicit null rather than omitted, hence `| null`.
  */
@@ -749,8 +725,8 @@ export interface HallOfFameResponse {
 /**
  * A single place (1-10) or a grouped place range (11-20, 21-50) in the distribution.
  *
- * `prizes` uses the shared `Prize` union: /HallOfFame/distribution serializes its prizes through
- * the same PrizeConverter as the room configs, so the shapes are identical.
+ * `prizes` uses the shared `Prize` union: /HallOfFame/distribution returns prizes in exactly the
+ * same shape (and mixed casing) as the room configs.
  */
 export interface HOFDistributionItem {
   place: number;
@@ -778,10 +754,10 @@ export enum CampaignLevelStatus {
 /**
  * Machine-readable codes carried by CampaignError.Code.
  *
- * All but two mirror the backend's own error identifiers byte for byte. NoActiveAttempt is
+ * All but two match the error identifiers the API returns, byte for byte. NoActiveAttempt is
  * CLIENT-side only - CompleteCampaignLevel throws it before any I/O when there is no attempt to
  * submit against. Unknown covers any body the SDK cannot parse and any identifier it does not
- * recognise (e.g. one added by a newer backend).
+ * recognise (e.g. one added by a newer API version).
  */
 export enum CampaignErrorCode {
   CampaignNotAvailable = 'CampaignNotAvailable',
@@ -855,7 +831,7 @@ export interface CampaignStarTier {
 /**
  * A level's parsed star rules: what counts as a win, and what earns each star.
  * Parsed client-side from the wire's StarRulesJson; null on the level while it is Locked, and
- * null again when the stored JSON does not parse.
+ * null again when that JSON does not parse.
  */
 export interface CampaignStarRules {
   Win: CampaignStarRuleCondition[];
@@ -916,7 +892,7 @@ export interface CampaignAttemptData {
 /**
  * The metrics a finished run submits: a flat name -> value map.
  * Booleans are legal and are normalized to 1/0 before encryption. Numbers may be fractional -
- * the backend stores doubles, so unlike EndRoomSP's int Score nothing is truncated.
+ * unlike EndRoomSP's int Score, nothing is truncated.
  */
 export type CampaignMetrics = Record<string, number | boolean>;
 
@@ -938,15 +914,14 @@ export interface CampaignCompletionResult extends CampaignProgressSummary {
 /* ============================================================================================
  * WIRE-LEVEL PLUMBING - INTERNAL. NOT PART OF THE PUBLIC API.
  *
- * Everything below models exactly what the HTTP endpoints actually return, byte for byte, as
- * captured live from staging on 2026-07-15. These are NOT the models games consume: the public
- * ViewModels above (RoomViewModel, TierViewModel, VoucherData, ...) are client-side COMPOSED
- * models that the mapping layer builds from these wire shapes, mirroring what Unity's
- * RoomsProvider does.
+ * Everything below models exactly what the HTTP endpoints actually return, byte for byte.
+ * These are NOT the models games consume: the public ViewModels above (RoomViewModel,
+ * TierViewModel, VoucherData, ...) are client-side COMPOSED models that the mapping layer builds
+ * from these wire shapes.
  *
  * Do not export these and do not hand them to game code. Do not "normalize" the casing - the
  * mixture of PascalCase envelopes and snake_case bodies is what the server really sends.
- * If you need to change a shape here, capture the payload first; never infer it from a C# DTO.
+ * If you need to change a shape here, check a real response first; never guess it.
  * ============================================================================================ */
 
 /** GET /Rooms/tiers -> one entry of the `data` array. */
@@ -975,13 +950,11 @@ interface WireRoomsResponse {
 
 /**
  * One entry of `leaders` on GET /Rooms/leaders.
- * Observed: {"id":1058,"score":1234,"place":1,"prizes":[],"finish_reason":0,"FinishReason":0}
+ * Example: {"id":1058,"score":1234,"place":1,"prizes":[],"finish_reason":0,"FinishReason":0}
  *
- * The wire carries the finish reason TWICE. `finish_reason` is the real serialized field;
- * `FinishReason` is a C# computed property on the DTO (`RoomFinishReason FinishReason =>
- * (RoomFinishReason) finish_reason`) that the serializer emits as well. It is the same value in a
- * different case, always derived from `finish_reason` and never independent, so only the lowercase
- * one is modelled here. Read `finish_reason`; the twin is redundant and should not be relied on.
+ * The wire carries the finish reason TWICE: `finish_reason` and `FinishReason`. They are always
+ * the same value in a different case, so only the lowercase one is modelled here. Read
+ * `finish_reason`; the twin is redundant and should not be relied on.
  */
 interface WireLeader {
   /** The PLATFORM user id - matches UserData.PlatformId, not UserData.UserId. */
@@ -993,7 +966,7 @@ interface WireLeader {
   finish_reason: number;
 }
 
-/** An `items` entry on GET /Rooms/leaders. Came back [] on every capture. */
+/** An `items` entry on GET /Rooms/leaders. The array is normally empty. */
 interface WireLeadersItem {
   id: number;
   image: string;
@@ -1003,17 +976,17 @@ interface WireLeadersItem {
 
 /**
  * GET /Rooms/leaders - bare, no envelope.
- * Observed: {"state":0,"leaders":[...],"items":[],"match_id":null}
+ * Example: {"state":0,"leaders":[...],"items":[],"match_id":null}
  */
 interface WireRoomLeadersResponse {
-  /** A LeadersState number. Sent as an int - the backend field is a plain `int`. */
+  /** A LeadersState number. Sent as an int. */
   state: number;
   leaders: WireLeader[];
   items: WireLeadersItem[];
   match_id: string | null;
 }
 
-/** An `avatar`/`border` on a platform user. Observed: {"url":"https://...","type":"static"}. */
+/** An `avatar`/`border` on a platform user. Example: {"url":"https://...","type":"static"}. */
 interface WirePlatformImage {
   url: string;
   type: string;
@@ -1029,7 +1002,7 @@ interface WirePlatformUser {
 
 /**
  * GET {funticoApiUri}/api/v1/web/users?ids[]=... - the PLATFORM host, authorised with the user's
- * PLATFORM token (config.userToken), NOT the game JWT. Observed:
+ * PLATFORM token (config.userToken), NOT the game JWT. Example:
  * {"data":[{"id":1058,"name":"player_49","avatar":{...},"border":{...}}]}
  */
 interface WireUsersInfoResponse {
@@ -1039,8 +1012,7 @@ interface WireUsersInfoResponse {
 /**
  * `game_session` on GET /Rooms/get-history.
  *
- * The key is SINGULAR - `game_session`. Unity's C# model names the member `GameSessions`
- * (plural), which is a client-side misnomer that does not exist on the wire. Do not copy it.
+ * The key is SINGULAR - `game_session`. There is no plural `game_sessions` / `GameSessions` key.
  */
 interface WireGameSession {
   id: string;
@@ -1070,7 +1042,7 @@ interface WireSessionHistoryResponse {
   event?: WireRoomConfig;
 }
 
-/** `ticket` on a room config. Observed: {"type":1,"currency_amount":250,"item_id":null,"item":null}. */
+/** `ticket` on a room config. Example: {"type":1,"currency_amount":250,"item_id":null,"item":null}. */
 interface WireTicket {
   /** TicketType: 0 = Free, 1 = Currency, 2 = Item. Not the same enum as EntryFeeType. */
   type: number | null;
@@ -1079,7 +1051,7 @@ interface WireTicket {
   item: PlatformItemPrize | null;
 }
 
-/** `prize_pool.platform_fee`. Observed: {"type":"platform_fee","value":20,"burn_percentage":0}. */
+/** `prize_pool.platform_fee`. Example: {"type":"platform_fee","value":20,"burn_percentage":0}. */
 interface WirePlatformFee {
   type: string;
   /** The platform fee PERCENTAGE, not an absolute amount. The absolute is computed.platform_fee. */
@@ -1089,8 +1061,8 @@ interface WirePlatformFee {
 
 /**
  * `prize_pool` on a room config.
- * `gpp` and `game_managed` came back null on every room captured, so their populated shapes are
- * unproven - left as `unknown` rather than guessed. Capture a GPP room before typing them.
+ * `gpp` and `game_managed` are usually null and their populated shapes are not modelled - left as
+ * `unknown` rather than guessed. Check a real GPP room response before typing them.
  */
 interface WirePrizePool {
   gpp: unknown;
@@ -1100,7 +1072,7 @@ interface WirePrizePool {
 
 /**
  * `leaderboard` on a room config.
- * Observed: {"field":"points","placement_mode":"descending","type":"local","claim_limit":0,
+ * Example: {"field":"points","placement_mode":"descending","type":"local","claim_limit":0,
  *            "attempts":null,"fn":null}
  */
 interface WireLeaderboardConfig {
@@ -1112,7 +1084,7 @@ interface WireLeaderboardConfig {
   fn: string | null;
 }
 
-/** `prize_distribution[].xp`. Observed: {"base":10,"kyc":12}. */
+/** `prize_distribution[].xp`. Example: {"base":10,"kyc":12}. */
 interface WireXpPoints {
   base: number;
   kyc: number;
@@ -1127,7 +1099,7 @@ interface WirePrizeDistribution {
 
 /**
  * `computed` on a room config - server-side derived totals.
- * Observed: {"deposit_stake":1250,"stake":1250,"platform_fee":250,"burn":0,
+ * Example: {"deposit_stake":1250,"stake":1250,"platform_fee":250,"burn":0,
  *            "platform_fee_per_ticket":50}
  */
 interface WireComputed {
@@ -1176,8 +1148,7 @@ interface WireRoomConfig {
   /** Unix epoch milliseconds. */
   updated_at: number | null;
   /**
-   * A TournamentResponse-shaped PascalCase object. Every field of it came back 0/false/null on
-   * every captured room, so the real member types are unproven and it is deliberately left
+   * A PascalCase object whose fields are normally 0/false/null. It is deliberately left
    * unknown - nothing in the mapping layer reads it. Games that need it should call
    * GetRoomSettings(), which returns the game-defined settings blob.
    */
@@ -1227,10 +1198,8 @@ interface WireJoinRoomResponse {
 }
 
 /* ---- Campaign wire shapes ----
- * PROVISIONAL: designed in tandem with the backend (plain PascalCase resolver, enums as ints,
- * no [JsonProperty]) but NOT yet captured live. Capture each payload from staging before
- * shipping and stamp the capture date here; if the backend deviates, fix THESE shapes to match
- * the bytes and absorb the difference in the map* functions.
+ * PascalCase field names, enums as ints. If a real response ever differs from these shapes, fix
+ * THESE shapes to match the bytes and absorb the difference in the map* functions.
  */
 
 /** GET /Campaign/availability - bare, no envelope. Always 200. */
@@ -1321,7 +1290,7 @@ interface WireCampaignErrorBody {
 
 /**
  * Cryptography helper class leveraging the browser Web Crypto API.
- * Ensures complete compatibility with C# AESNonDynamic and HashUtils.
+ * Produces the encrypted payloads and signatures the Funtico API expects.
  */
 export class CryptoHelper {
   private static formatKey(key: string): string {
@@ -1335,7 +1304,6 @@ export class CryptoHelper {
 
   /**
    * Encrypts plaintext using AES-128-CBC with PKCS7 padding and a static IV.
-   * Mirrors C# AESNonDynamic.Encrypt.
    */
   public static async encrypt(plainText: string, keyStr: string): Promise<string> {
     const formattedKey = this.formatKey(keyStr);
@@ -1370,7 +1338,6 @@ export class CryptoHelper {
 
   /**
    * Decrypts ciphertext using AES-128-CBC with PKCS7 padding and a static IV.
-   * Mirrors C# AESNonDynamic.Decrypt.
    */
   public static async decrypt(encryptedBase64: string, keyStr: string): Promise<string> {
     const formattedKey = this.formatKey(keyStr);
@@ -1405,7 +1372,6 @@ export class CryptoHelper {
 
   /**
    * Computes HMAC-SHA256 signature represented as a hex string.
-   * Mirrors C# HashUtils.HashString.
    */
   public static async hmacSha256(message: string, keyStr: string): Promise<string> {
     const encoder = new TextEncoder();
@@ -1435,7 +1401,6 @@ export class CryptoHelper {
 
 /**
  * Funtico SDK - Core Service Facade.
- * Implements 100% of Unity SDK features.
  */
 export class FunticoSDK {
   private static _instance: FunticoSDK | null = null;
@@ -1455,7 +1420,6 @@ export class FunticoSDK {
   private cacheExpiresAt: number = 0;
 
   // Raw room configs from the last GetRooms call, kept for GetTierByEventId.
-  // Mirrors Unity's RoomsProviderInternal.LastRoomsResponse.
   private lastRoomsResponse: WireRoomConfig[] | null = null;
 
   // Local client session storage (for reconnection and logging events)
@@ -1486,15 +1450,13 @@ export class FunticoSDK {
    * A bad key does not fail where it is passed in: the public key only fails at the first request
    * (auth rejected), and a bad private key survives even that - it is only used to encrypt/sign
    * payloads. A secret for the wrong game/environment usually fails at the first encrypted call
-   * (e.g. CreateSession_Client), but the concatenated-keys incident keeps the last 8 characters
-   * that sessions use, so there the first symptom is an opaque HTTP 500 ("Padding is invalid and
-   * cannot be removed") from the server's AESNonDynamic.Decrypt on /Rooms/end-room-sp, after a
-   * whole match has been played. Every rule below catches a mistake that can NEVER work, so it is
-   * reported up front with a readable message instead.
+   * (e.g. CreateSession_Client), but some wrong keys only surface as an opaque HTTP 500 ("Padding
+   * is invalid and cannot be removed") on /Rooms/end-room-sp, after a whole match has been played.
+   * Every rule below catches a mistake that can NEVER work, so it is reported up front with a
+   * readable message instead.
    *
-   * Deliberately NO format rules (GUID shape, charset, exact length): secret keys are inserted into
-   * the DB by hand, and public keys are GUIDs on legacy games but URL-safe base64 on new ones. A
-   * rule here must never reject a key the server legitimately issued.
+   * Deliberately NO format rules (GUID shape, charset, exact length): keys are issued in more than
+   * one format. A rule here must never reject a key the platform legitimately issued.
    *
    * Messages never contain the key values themselves (they end up in logs and error trackers);
    * lengths are fine.
@@ -1520,12 +1482,12 @@ export class FunticoSDK {
     }
 
     // No issued key has surrounding whitespace; it is almost always a stray newline/CR (or a BOM)
-    // from a .env file or a copy-paste. In privateGameKey it silently changes the derived
-    // AES/HMAC/session keys, so the server cannot decrypt. In publicGameKey the effect is less
-    // uniform: fetch strips leading/trailing space/tab/CR/LF from the X-User-Key header value, so
-    // ordinary requests would still work, but the untrimmed key feeds the X-Server-Key HMAC
-    // (getServerHeaders), and a BOM or other non-ASCII whitespace (which trim() also catches) makes
-    // fetch throw on the header. Both keys are rejected so a broken .env fails fast and consistently.
+    // from a .env file or a copy-paste. In privateGameKey it silently breaks every encrypted or
+    // signed payload. In publicGameKey the effect is less uniform: fetch strips leading/trailing
+    // space/tab/CR/LF from the X-User-Key header value, so ordinary requests would still work, but
+    // the untrimmed key is also used for X-Server-Key (getServerHeaders), and a BOM or other
+    // non-ASCII whitespace (which trim() also catches) makes fetch throw on the header. Both keys
+    // are rejected so a broken .env fails fast and consistently.
     // Note: a publicGameKey with a trailing newline used to work for plain requests and is now
     // rejected here.
     if (publicGameKey !== publicGameKey.trim()) {
@@ -1535,9 +1497,8 @@ export class FunticoSDK {
       fail("privateGameKey has leading or trailing whitespace (a stray newline/CR from a .env file or copy-paste?). Trim it.");
     }
 
-    // The server derives every payload key with SecretKey.Substring(0, 8), and the client mirrors it
-    // (AES key = id prefix + privateGameKey[0..8], HMAC key = privateGameKey[8..]). A shorter key
-    // throws on the server for every encrypted request, so it can never work.
+    // Every encrypted request needs at least 8 characters of privateGameKey; a shorter key is
+    // rejected on every encrypted request, so it can never work.
     if (privateGameKey.length < 8) {
       fail(`privateGameKey is too short (${privateGameKey.length} characters, at least 8 required). Pass the full secret key from the Developer Portal.`);
     }
@@ -1546,9 +1507,9 @@ export class FunticoSDK {
       fail("privateGameKey is the same as publicGameKey. Pass the secret key from the Developer Portal in privateGameKey, not the public key.");
     }
 
-    // Auth still works (it only uses the public key), but the AES key becomes the first 8 chars of
-    // the PUBLIC key and the HMAC key is shifted too, so the server fails to decrypt with a 500
-    // "Padding is invalid" on end-room-sp. Containment in either direction means the fields were mixed.
+    // Auth still works (it only uses the public key), but encrypted/signed payloads are built from
+    // the wrong key material, so score submission fails (typically HTTP 500 "Padding is invalid" on
+    // end-room-sp). Containment in either direction means the fields were mixed.
     if (privateGameKey.includes(publicGameKey) || publicGameKey.includes(privateGameKey)) {
       fail(`privateGameKey and publicGameKey overlap (privateGameKey is ${privateGameKey.length} characters, publicGameKey is ${publicGameKey.length}); the keys look concatenated or pasted into one field. Pass only the secret key from the Developer Portal in privateGameKey, and the public key alone in publicGameKey.`);
     }
@@ -1636,12 +1597,10 @@ export class FunticoSDK {
   }
 
   /**
-   * Headers for the dedicated-server endpoints, which sit behind ServerApiKeyFilter.
+   * Headers for the dedicated-server endpoints.
    *
-   * The filter demands BOTH headers: it looks the game up by X-User-Key (the public key), then
-   * requires X-Server-Key to equal HashUtils.HashString(secretKey, funticoKey) - that is
-   * HMAC-SHA256 with the PUBLIC key as the key and the PRIVATE key as the message, hex lowercase.
-   * The private key is therefore never sent, only proven; sending it raw is what used to 401.
+   * These endpoints require BOTH headers: X-User-Key (the public key) and X-Server-Key, which is
+   * computed from the game keys. The private key itself is never sent.
    *
    * Async because Web Crypto's sign() is.
    */
@@ -1655,17 +1614,14 @@ export class FunticoSDK {
   }
 
   /**
-   * Calculates the session encryption key matching C# GetEncryptionKey(userId) logic.
-   * Encryption key = userGuidStr (first 8 chars of userId Guid) + privateKeyPart (last 8 chars of privateGameKey)
+   * Derives the per-user key used to encrypt session payloads. Requires user data to be loaded.
    */
   private getSessionEncryptionKey(): string {
     const userId = this.cachedUserData?.UserId;
     if (userId === undefined) {
       throw new Error("User data is not loaded. Cannot derive session encryption key.");
     }
-    // C# IntToGuid interprets bytes in Little Endian, returning userId as hex padded to 8 chars
     const userGuidStr = userId.toString(16).padStart(8, '0');
-    // C# key.Substring(key.Length - 8)
     const privateKey = this.config.privateGameKey;
     const privateKeyPart = privateKey.substring(privateKey.length - 8);
 
@@ -1724,10 +1680,8 @@ export class FunticoSDK {
    * is decided on.
    *
    * Only vouchers the user actually holds come back here, so a tier the user has none of is absent
-   * from the list rather than present with Count 0. Unity additionally seeds the list from
-   * vouchers-data so its UI can grey out the tiers you don't hold; that extra call is skipped here
-   * because it cannot change any decision this SDK makes - an absent voucher and a Count-0 voucher
-   * both yield UserCanJoinWithVoucher === false.
+   * from the list rather than present with Count 0. Either way the result is the same: an absent
+   * voucher and a Count-0 voucher both yield UserCanJoinWithVoucher === false.
    */
   public async GetVouchers(useCache = true): Promise<VoucherData[]> {
     if (useCache && this.cachedVouchers && Date.now() < this.cacheExpiresAt) {
@@ -1787,13 +1741,11 @@ export class FunticoSDK {
   /* ================= Rooms Mapping Layer (wire -> ViewModel) =================
    *
    * The endpoints return raw wire shapes (snake_case configs inside PascalCase envelopes); the
-   * public models are client-side COMPOSED ViewModels. These helpers are the bridge. They mirror
-   * Unity's RoomsProvider/RoomsProviderInternal, which is the reference implementation - without
+   * public models are client-side COMPOSED ViewModels. These helpers are the bridge - without
    * them every field of every returned model reads undefined.
    */
 
   /**
-   * Port of Unity's TicketExtensions.IsFree.
    * A room is free when it has no ticket type, an explicitly Free one, or costs nothing.
    */
   private isTicketFree(ticket: WireTicket): boolean {
@@ -1803,7 +1755,7 @@ export class FunticoSDK {
   }
 
   /**
-   * Port of Unity's RoomsProviderInternal.GetYourFee.
+   * The fee the user effectively paid for a seat.
    * A seat paid for with a voucher did not cost its ticket price, so the effective fee becomes the
    * voucher's item rather than the room's ticket. That flips IsFree and zeroes Multiplier (an Item
    * fee has no currency amount to divide by).
@@ -1850,7 +1802,7 @@ export class FunticoSDK {
   }
 
   /**
-   * Port of the EntryFeeUSDT switch in Unity's RoomViewModel constructor.
+   * RoomViewModel.EntryFeeUSDT for a room type and tier.
    * External rooms use a different scale from in-platform ones; unknown/Free tiers are worth 0.
    */
   private entryFeeUsdt(roomType: string | null, tier: RoomTier): number {
@@ -1871,19 +1823,17 @@ export class FunticoSDK {
   }
 
   /**
-   * Composes a RoomViewModel from a raw room config, per Unity's RoomViewModel constructor.
+   * Composes a RoomViewModel from a raw room config.
    *
    * `vouchers` must already be loaded - the voucher match drives UserCanJoinWithVoucher, which
    * JoinRoom uses to decide whether to spend a voucher. Pass [] only where there is no user to
    * hold vouchers (GetRoomPublic).
    */
   private mapRoomConfig(config: WireRoomConfig, vouchers: VoucherData[]): RoomViewModel {
-    // Unity leaves Tier at its default (0 = Contender) when details.tier is null, because the
-    // assignment is guarded by a null check. Mirrored deliberately.
+    // A null details.tier leaves Tier at its default (0 = Contender). Deliberate.
     const tier: RoomTier = config.details.tier ?? RoomTier.Contender;
 
-    // Matched against the RAW tier, not the defaulted one: a null-tier room matches no voucher,
-    // which is what Unity's `voucher.Tier == config.Details.Tier` (int vs int?) does.
+    // Matched against the RAW tier, not the defaulted one: a null-tier room matches no voucher.
     const voucher = vouchers.find(v => v.Tier === config.details.tier);
 
     const room: RoomViewModel = {
@@ -1902,8 +1852,7 @@ export class FunticoSDK {
     };
 
     if (voucher !== undefined) room.Voucher = voucher;
-    // Optional fields are assigned only when the wire actually carried them, matching the
-    // set-only-if-non-null behaviour of Unity's constructor.
+    // Optional fields are assigned only when the wire actually carried them (non-null).
     if (config.details.description !== null) room.Description = config.details.description;
     if (config.details.has_password !== null) room.HasPassword = config.details.has_password;
     if (config.size !== null) room.RoomSize = config.size;
@@ -1911,7 +1860,7 @@ export class FunticoSDK {
     return room;
   }
 
-  /** Composes a TierViewModel from a /Rooms/tiers entry, per Unity's RoomsProvider.GetTiers. */
+  /** Composes a TierViewModel from a /Rooms/tiers entry. */
   private mapTier(tier: WireTierData): TierViewModel {
     return {
       Tier: tier.tier,
@@ -1995,13 +1944,12 @@ export class FunticoSDK {
   /**
    * Lists rooms of the given type.
    * Vouchers are loaded first so each room's Voucher/UserCanJoinWithVoucher resolve, and the
-   * pre-paid list is applied afterwards. Mirrors Unity's RoomsProviderInternal.GetRooms.
+   * pre-paid list is applied afterwards.
    *
-   * The voucher fetch FORCE-REFRESHES (useCache=false), exactly as Unity does at
-   * RoomsProviderInternal.cs:103. This is not incidental: joining a room SPENDS a voucher, so a
-   * cached count goes stale the moment the player enters. Serving a stale Count>0 would leave
-   * UserCanJoinWithVoucher true, JoinRoom would derive useVoucher=true, and the server would
-   * reject the join - locking the player out of a room they can actually afford.
+   * The voucher fetch FORCE-REFRESHES (useCache=false). This is not incidental: joining a room
+   * SPENDS a voucher, so a cached count goes stale the moment the player enters. Serving a stale
+   * Count>0 would leave UserCanJoinWithVoucher true, JoinRoom would derive useVoucher=true, and the
+   * server would reject the join - locking the player out of a room they can actually afford.
    */
   public async GetRooms(roomType: number = 0, limit: number = 10): Promise<RoomViewModel[]> {
     const vouchers = await this.GetVouchers(false);
@@ -2030,8 +1978,8 @@ export class FunticoSDK {
 
   /**
    * Fetches one room as the signed-in user sees it.
-   * Force-refreshes vouchers for the same reason GetRooms does (Unity: RoomsProviderInternal.cs:92)
-   * - and it matters more here, because JoinRoom calls this to decide whether to spend one.
+   * Force-refreshes vouchers for the same reason GetRooms does - and it matters more here,
+   * because JoinRoom calls this to decide whether to spend one.
    */
   public async GetRoom(roomId: string): Promise<RoomViewModel> {
     const vouchers = await this.GetVouchers(false);
@@ -2060,8 +2008,7 @@ export class FunticoSDK {
   /**
    * Composes a room's prize table.
    *
-   * There is NO endpoint for this - Unity builds it client-side from the room config
-   * (RoomsProviderInternal.GetPrizePoolDistribution) and so does this.
+   * There is NO endpoint for this - the SDK builds it client-side from the room config.
    */
   public async GetPrizePoolDistribution(roomGuid: string): Promise<PrizePoolDistributionViewModel> {
     const config = await this.getRoomConfig(roomGuid);
@@ -2094,7 +2041,7 @@ export class FunticoSDK {
       TotalTicoAccumulated: totalTicoAccumulated,
       TicoSharedViaPlaces: ticoSharedViaPlaces,
       TotalPlayers: totalPlayers,
-      // Unity's getters. TicoPerPlayer is C# long division, hence the floor.
+      // TicoPerPlayer is an integer division, hence the floor.
       TicoPerPlayer: Math.floor(totalTicoAccumulated / totalPlayers),
       PlatformFeePercentage: config.prize_pool.platform_fee.value ?? 0,
       PlatformFee: platformFee,
@@ -2107,10 +2054,8 @@ export class FunticoSDK {
    * call and fetching it first if there is none. Returns null for an unknown event id.
    *
    * @param roomType Which list to populate on a cache miss, matching GetRooms' own parameter
-   *                 (0 = singleplayer, 1 = multiplayer). Unity's signature is
-   *                 GetTierByEventId(eventId, roomType) and it forwards the value to
-   *                 UpdateRoomsList; without it the miss path always fetched singleplayer rooms,
-   *                 so a multiplayer event id could never be found and returned null forever.
+   *                 (0 = singleplayer, 1 = multiplayer). Pass 1 for a multiplayer event id:
+   *                 otherwise the miss path fetches singleplayer rooms and the id is never found.
    *                 Defaults to 0 to match GetRooms and keep existing callers working.
    */
   public async GetTierByEventId(eventId: string, roomType: number = 0): Promise<RoomTier | null> {
@@ -2177,7 +2122,7 @@ export class FunticoSDK {
   }
 
   /**
-   * Composes the end-of-room leaderboard, per Unity's RoomsProviderInternal.GetLeaderboard.
+   * Composes the end-of-room leaderboard.
    *
    * /Rooms/leaders alone answers almost none of this model: it carries ids, scores and places, but
    * the room's name/tier/fee live on the room config, the players' names live on the PLATFORM host,
@@ -2185,14 +2130,12 @@ export class FunticoSDK {
    * and joins them. The three independent legs run concurrently; only the name lookup is
    * sequential, because it needs the ids that /Rooms/leaders returns.
    *
-   * Deviations from Unity, both deliberate:
-   *   - Unity returns early with LeaderboardItems left null when you are not on the board (a
-   *     spectator). Here the items are always populated - a null there is what made the old
-   *     passthrough throw on `.map`, and an empty board is representable while `undefined` is not.
-   *   - Unity threads a `predictPending` flag to choose between the room's prize_distribution and
-   *     the leader's own `prizes`. This always reads prize_distribution for the place: a placed
-   *     (unsettled) room reports `prizes: []` on every leader, so the distribution is the only
-   *     source that can answer "what did I win" before settlement.
+   * Behaviour worth knowing:
+   *   - LeaderboardItems is always populated (possibly empty), even when you are not on the board
+   *     (a spectator).
+   *   - Your prizes always come from the room's prize_distribution for your place, not from the
+   *     leader's own `prizes`: a placed (unsettled) room reports `prizes: []` on every leader, so
+   *     the distribution is the only source that can answer "what did I win" before settlement.
    */
   public async GetLeaderboard(eventId: string, sessionId: string, matchId?: string): Promise<RoomLeaderboardViewModel> {
     const [leaders, history, config, user] = await Promise.all([
@@ -2244,8 +2187,8 @@ export class FunticoSDK {
       IsPending: state === LeadersState.placed,
       ClosedUnsuccessfully: state === LeadersState.returned || state === LeadersState.to_be_returned,
       RoomName: config.details.name,
-      // Unity defaults a null tier to Challenger here - note this is a DIFFERENT default from
-      // mapRoomConfig's Contender. Both are mirrored as-is rather than reconciled.
+      // A null tier defaults to Challenger here - note this is a DIFFERENT default from
+      // mapRoomConfig's Contender. Both are deliberate; do not reconcile them.
       RoomTier: config.details.tier ?? RoomTier.Challenger,
       IsFree: this.isTicketFree(yourFee),
       YourTicoEarnings: yourTicoEarnings,
@@ -2260,15 +2203,14 @@ export class FunticoSDK {
   /**
    * Joins a room and returns the session to play it under.
    *
-   * Two legs, mirroring Unity's RoomsProvider.JoinRoom:
+   * Two legs:
    *   1. POST /Rooms/join-room reserves the seat and hands back a short-lived lobby quote.
    *   2. POST /Rooms/start-room-sp converts that quote into the real game session.
    * A player who had already joined skips leg 2 - the server returns their existing session on
    * leg 1 and there is no quote to convert.
    *
-   * `idempotencyKey` is a REQUIRED query param: the action's parameter is a non-nullable reference
-   * type under an [ApiController], so ASP.NET treats it as [Required] and rejects the request with
-   * a 400 before the action body runs. A fresh key per call is what makes the retry safe.
+   * `idempotencyKey` is a REQUIRED query param: without it the request is rejected with a 400.
+   * A fresh key per call is what makes the retry safe.
    *
    * @param useVoucher Spend a free-entry voucher instead of the entry fee. Omit to let the room
    *                   decide via UserCanJoinWithVoucher, which is what the platform UI does.
@@ -2306,7 +2248,7 @@ export class FunticoSDK {
 
     const lobbyQuoteId = joinResponse.lobby_quote?.id;
     if (!lobbyQuoteId) {
-      // Unity falls back to a locally generated Guid here, which the server would only reject.
+      // A locally generated id would only be rejected by the server, so fail loudly instead.
       throw new Error("Failed to join room: the server returned neither an existing session nor a lobby quote");
     }
 
@@ -2342,6 +2284,9 @@ export class FunticoSDK {
 
   /**
    * Ends a room session and sends the player's encrypted score to the game API (Client-side).
+   *
+   * The score is encrypted and signed with privateGameKey. If this fails with HTTP 500 "Padding is
+   * invalid and cannot be removed", the privateGameKey is wrong.
    */
   public async EndRoomSP(
     eventId: string,
@@ -2352,8 +2297,8 @@ export class FunticoSDK {
     gameEvents: string[] = []
   ): Promise<any> {
     const scorePayload = {
-      // The backend deserializes Score as an int OUTSIDE its try/catch, so a fractional value is
-      // an unhandled 500 rather than a validation error. Truncate before it leaves the client.
+      // Score must be an integer: a fractional value fails with HTTP 500 rather than a validation
+      // error. Truncate before it leaves the client.
       Score: Math.trunc(score),
       UserId: userId,
       Ip: ip,
@@ -2469,8 +2414,7 @@ export class FunticoSDK {
     });
     if (!response.ok) throw new Error("Failed to join special tournament");
 
-    // A success is `200 text/plain: Success, now you can play` - NOT JSON. Parsing it threw a
-    // SyntaxError on every successful join, so this used to be reachable only through a catch block.
+    // A success is `200 text/plain: Success, now you can play` - NOT JSON, so it is read as text.
     await response.text();
     return response.ok;
   }
@@ -2590,7 +2534,7 @@ export class FunticoSDK {
     customData = ""
   ): Promise<boolean> {
     const scorePayload = {
-      // Truncated for the same reason as EndRoomSP: Score is deserialized as an int.
+      // Truncated for the same reason as EndRoomSP: Score must be an integer.
       Score: Math.trunc(score),
       IsSuccess: isSuccess,
       CustomData: customData,
@@ -2602,7 +2546,7 @@ export class FunticoSDK {
     const encryptionKey = saveScoreId.substring(0, 8) + this.config.privateGameKey.substring(0, 8);
     const encryptedData = await CryptoHelper.encrypt(plainText, encryptionKey);
 
-    // Signature key starting from character 8
+    // Signature key derived from privateGameKey
     const hashKey = this.config.privateGameKey.substring(8);
     const hash = await CryptoHelper.hmacSha256(encryptedData, hashKey);
 
@@ -2695,8 +2639,8 @@ export class FunticoSDK {
    * IsAvailable false for a game without one. Gate the campaign menu button on the flag rather
    * than wrapping this call in try/catch for that case - a rejection means a real failure.
    *
-   * Works BEFORE authentication: the endpoint is [AllowAnonymous] on the backend so a pre-login
-   * menu can gate its campaign button - only the game key is required. The JWT is attached when
+   * Works BEFORE authentication: the endpoint does not require sign-in, so a pre-login menu can
+   * gate its campaign button - only the game key is required. The JWT is attached when
    * one exists, but its absence does not throw, unlike every other Campaign method.
    *
    * Shares the SDK-wide cache window (FunticoConfig.cacheTTL) with the other cached getters.
@@ -2846,8 +2790,7 @@ export class FunticoSDK {
    * Metrics are validated and normalized BEFORE anything is encrypted (violations throw a
    * CampaignError with Code InvalidMetrics client-side): 1-32 entries, each name 1-64 chars,
    * each value a finite number or a boolean. Booleans become 1/0; numbers pass through
-   * UNTRUNCATED - the backend stores doubles, so fractional values are legal, unlike
-   * EndRoomSP's int Score.
+   * UNTRUNCATED - fractional values are legal, unlike EndRoomSP's int Score.
    *
    * Events recorded via RecordEvent_Client are folded into the encrypted payload, the same way
    * EndRoomSP folds them into a room score; the log is reset once a submission delivers them.
@@ -2875,9 +2818,8 @@ export class FunticoSDK {
 
     const normalizedMetrics = this.normalizeCampaignMetrics(metrics);
 
-    // Mirrors EndRoomSP's scheme exactly, with the attempt id standing in for
-    // sessionOrMatchId: AES key = first 8 of the attempt id + first 8 of the private key;
-    // HMAC over the BASE64 ciphertext with the private key from character 8.
+    // Same encrypt-and-sign scheme as EndRoomSP, with the attempt id standing in for
+    // sessionOrMatchId.
     const plainText = JSON.stringify({
       AttemptId: activeAttempt.AttemptId,
       LevelId: activeAttempt.LevelId,
@@ -2966,8 +2908,8 @@ export class FunticoSDK {
       if (typeof value === 'boolean') {
         normalized[name] = value ? 1 : 0;
       } else if (typeof value === 'number' && Number.isFinite(value)) {
-        // Deliberately NOT truncated: the backend field is a double, so fractional metrics are
-        // legal - this is the one score-like payload where Math.trunc would corrupt data.
+        // Deliberately NOT truncated: fractional metrics are legal - this is the one
+        // score-like payload where Math.trunc would corrupt data.
         normalized[name] = value;
       } else {
         throw new CampaignError(
@@ -3202,7 +3144,10 @@ export class FunticoSDK {
     return [...this.currentClientSessionEvents];
   }
 
-  /* ================= Dedicated Server Session Methods ================= */
+  /* ================= Dedicated Server Session Methods =================
+   *
+   * NOTE: The Dedicated Server methods are not supported at the moment; do not use them.
+   */
 
   /**
    * Registers a new multiplayer session on the API from a Dedicated Game Server.
@@ -3271,16 +3216,14 @@ export class FunticoSDK {
   /**
    * Submits multiplayer results for all match participants in one payload from Dedicated Server.
    *
-   * The wire model is RoomEndRequestAllUsers: a root `scores` array of UserScore, each of which
-   * carries its own session id. Every key is snake_case - UserScore declares explicit
-   * [JsonProperty] names, so the PascalCase body this used to send bound to nothing and every
-   * score arrived as a default 0.
+   * The request body is a root `scores` array with one entry per participant, each of which
+   * carries its own session id. Every key is snake_case.
    *
-   * Note `user_id` is the FUNTICO user id, not the SDK-database UserId - that is how the backend
-   * looks players up (PlayerModels.FunticoId) to record Hall of Fame results.
+   * Note `user_id` is the FUNTICO user id (FunticoUserId), not UserId; results (including Hall of
+   * Fame) are recorded against it.
    *
-   * AdditionalData and GameEvents have no field on UserScore, so they are not transmitted; they
-   * stay on the parameter for source compatibility and server-side event tracking.
+   * AdditionalData and GameEvents are not transmitted; they stay on the parameter for source
+   * compatibility.
    */
   public async FinishRoomSession_Server(
     eventId: string,
@@ -3297,7 +3240,7 @@ export class FunticoSDK {
   ): Promise<boolean> {
     const scores = participants.map(p => ({
       game_session_id_or_match_id: sessionId,
-      // Deserialized as an int; truncate so a fractional score cannot 500 the request.
+      // Must be an integer; truncate so a fractional score cannot fail the request.
       score: Math.trunc(p.Score),
       is_suspected_cheater: false,
       user_ip_end_session: p.UserIp,

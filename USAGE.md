@@ -46,7 +46,7 @@ export interface FunticoConfig {
 - `privateGameKey` (`string`) - Your game's secret key from the Funtico Developer Portal. Used to sign and encrypt payloads. Never ship it in a public client build. Pass the secret key alone — never concatenated with the public key; `Initialize` rejects that (see [`Initialize`](#initialize) → **Throws**).
 - `publicGameKey` (`string`) - Your game's public key from the Funtico Developer Portal, sent with every request.
 - `userToken` (`string`, optional) - The player's platform token issued by the Funtico platform (in a web/Telegram Mini App build this usually arrives as a query parameter). When present, `Initialize` authenticates with it automatically and pre-warms the caches. When omitted, `Initialize` only resolves the base URL and you must call `Authentication` yourself before any authenticated method.
-- `apiBaseUrl` (`string`, optional) - Explicit base URL for the API gateway, without a trailing slash. When set, it **completely overrides** the environment-derived URL: `env` no longer decides where requests go. Use it to point the SDK at your own gateway, a regional deployment, or a local backend during development. Every SDK request is built as `${apiBaseUrl}/Controller/route`.
+- `apiBaseUrl` (`string`, optional) - Explicit base URL for the API gateway, without a trailing slash. When set, it **completely overrides** the environment-derived URL: `env` no longer decides where requests go. Use it to point the SDK at your own gateway, a regional deployment, or a local backend during development. Every SDK request is built as `${apiBaseUrl}/<Area>/<route>`, e.g. `${apiBaseUrl}/Rooms/get-rooms`.
 - `funticoApiBaseUrl` (`string`, optional) - Explicit base URL for the Funtico **platform** API, without a trailing slash. This is a **different host** from `apiBaseUrl`: `apiBaseUrl` is your game's Rooms API and takes the game JWT, while this one is the platform itself and takes the player's platform token (`userToken`). `GetLeaderboard` calls it to resolve player names, avatars and borders. Like `apiBaseUrl`, when set it completely overrides the environment-derived URL; otherwise `env` selects it — `staging` → `https://staging.api.funtico.com`, `prod` → `https://api.funtico.com`.
 - `cacheTTL` (`number`, optional) - Lifetime in milliseconds of the shared client-side cache backing `GetUserData`, `GetBalance`, `GetVouchers`, `GetCampaignAvailability` and `GetCampaignLevels`. While the cache is fresh, calls made with `useCache = true` return the stored copy with no network round-trip; once the window elapses, the next cached call refetches. Falsy values (including `0`) fall back to the default. Default: `30000` (30 seconds).
 
@@ -151,12 +151,12 @@ The config is rejected when:
 - `config` is missing or not an object.
 - `publicGameKey` is missing, not a string, or empty.
 - `privateGameKey` is missing, not a string, or empty.
-- Either key has leading or trailing whitespace. No issued key has any; it is almost always a stray newline/CR from a `.env` file or a copy-paste. In `privateGameKey` it would silently change the derived encryption keys, so trim the value where you read it.
-- `privateGameKey` is shorter than 8 characters. The server derives every encrypted payload's key with `SecretKey.Substring(0, 8)` (and the SDK mirrors it: AES key = id prefix + `privateGameKey[0..8]`, HMAC key = `privateGameKey[8..]`), so a shorter key can never work.
+- Either key has leading or trailing whitespace. No issued key has any; it is almost always a stray newline/CR from a `.env` file or a copy-paste. In `privateGameKey` it would silently break every encrypted submission, so trim the value where you read it.
+- `privateGameKey` is shorter than 8 characters. Such a key can never work with encrypted submissions.
 - `privateGameKey` is identical to `publicGameKey`.
-- One key contains the other (`privateGameKey` contains `publicGameKey`, or the reverse). This means the keys were concatenated or pasted into one field — for example `privateGameKey: publicKey + secretKey`. Such a config authenticates fine (authentication only uses the public key), but the AES key is then built from the first 8 characters of the **public** key and the HMAC key is shifted too, so the server cannot decrypt encrypted submissions — on `/Rooms/end-room-sp` this surfaces as HTTP 500 `"Padding is invalid and cannot be removed"`, after a whole match has been played. Pass only the secret key from the Developer Portal in `privateGameKey`, and the public key alone in `publicGameKey`.
+- One key contains the other (`privateGameKey` contains `publicGameKey`, or the reverse). This means the keys were concatenated or pasted into one field — for example `privateGameKey: publicKey + secretKey`. Such a config still signs in, but every encrypted submission is rejected — on `/Rooms/end-room-sp` this surfaces as HTTP 500 `"Padding is invalid and cannot be removed"`, after a whole match has been played. Pass only the secret key from the Developer Portal in `privateGameKey`, and the public key alone in `publicGameKey`.
 
-These are the only checks. There are deliberately no format rules beyond them (no GUID shape, charset or exact-length checks): public keys are GUIDs on older games and URL-safe base64 on newer ones, and a check must never reject a key the Developer Portal legitimately issued. The error messages never include the key values themselves — at most their lengths — so they are safe to forward to logs and error trackers.
+These are the only checks. There are deliberately no format rules beyond them (no GUID shape, charset or exact-length checks): key formats differ between games, and a check must never reject a key the Developer Portal legitimately issued. The error messages never include the key values themselves — at most their lengths — so they are safe to forward to logs and error trackers.
 
 **Usage:**
 ```typescript
@@ -211,10 +211,10 @@ public async Authentication(platformToken: string): Promise<any>
 
 **Login response Properties:**
 - `Token` (`string`) - The freshly minted game JWT. The SDK stores it and sends it as `Authorization: Bearer <token>` on every authenticated call, so you rarely need to read it off the response — use `getUserToken()` instead.
-- `Id` (`number`) - The player's SDK-side identifier (their row id in the game backend). This is the same value as `UserData.UserId`, and the one that `EndRoomSP` and the session encryption key expect.
+- `Id` (`number`) - The player's SDK-side identifier. This is the same value as `UserData.UserId`, and the one that `EndRoomSP` expects.
 - `PlatformId` (`number`) - The player's Funtico platform identifier. Same value as `UserData.PlatformId`.
 
-Behind the endpoint, the backend validates the platform token against the Funtico platform profile API, creates the player record on first ever login, and refreshes the stored TICO balance, display name, country, avatar and ticket counts before issuing the JWT — which is why a successful `Authentication` is also the moment the player's server-side profile becomes current.
+A successful `Authentication` also brings the player's game profile up to date with the Funtico platform (TICO balance, display name, country, avatar and ticket counts), and registers a player who has never played your game before.
 
 **Usage:**
 ```typescript
@@ -328,7 +328,7 @@ public async GetUserData(useCache = true): Promise<UserData>
 
 **UserData Properties:**
 - `Name` (`string`) - Player display name.
-- `UserId` (`number`) - The player's identifier inside the SDK database. This is the value passed as `userId` to `EndRoomSP` and `ResultTournament_Server`.
+- `UserId` (`number`) - The player's SDK-side identifier. This is the value passed as `userId` to `EndRoomSP` and `ResultTournament_Server`.
 - `PlatformId` (`number`) - The player's identifier on the Funtico platform. Match leaderboard rows against this value — `LeaderboardItemViewModel.UserId` and `TournamentPlayerViewModel.FunticoId` are platform ids.
 - `Level` (`number`) - Current player level.
 - `Rating` (`number`) - Current player rating.
@@ -734,14 +734,21 @@ public async GetRoomPublic(id: string): Promise<RoomViewModel>
 
 **Returns:** `Promise<RoomViewModel>` - The room's public details. Field meanings are the same as in the **RoomViewModel Properties** block above.
 
+> **Note:** `GetRoomPublic` may fail (HTTP 400) for a room that the authenticated `GetRoom` returns normally. Treat the preview as best-effort: catch the rejection and fall back to `GetRoom` once the player has signed in.
+
 **Usage:**
 ```typescript
 // Landing scene: preview a room from a share link before the player signs in.
 const roomId = new URLSearchParams(window.location.search).get('room');
 
 if (roomId) {
-  const room = await this.funtico.sdk.GetRoomPublic(roomId);
-  this.showRoomPreview(room.Name, room.EntryFee, room.TotalPrize);
+  try {
+    const room = await this.funtico.sdk.GetRoomPublic(roomId);
+    this.showRoomPreview(room.Name, room.EntryFee, room.TotalPrize);
+  } catch (err) {
+    // Best-effort preview (see the note above) - load it with GetRoom after login instead.
+    console.warn('Public room preview unavailable:', err);
+  }
 }
 ```
 
@@ -1068,7 +1075,7 @@ public async JoinRoom(roomGuid: string, useVoucher?: boolean): Promise<RoomSessi
 - `roomGuid` - Room unique identifier (`RoomViewModel.Guid`). Sent in the request body as `tournamentId`.
 - `useVoucher` - Whether to spend a free-entry voucher instead of paying the entry fee. **Omit it** to let the SDK decide: it looks the room up and uses its `UserCanJoinWithVoucher`. Pass `true`/`false` only to override that decision — passing `true` when the player holds no activated voucher gets the join rejected. Omitting it costs one extra request; passing it explicitly skips that lookup.
 
-**`JoinRoom` starts the run.** It is live by the time `JoinRoom` resolves and the server-side timers are already ticking. Load your level before calling `JoinRoom`, not between `JoinRoom` and gameplay.
+**`JoinRoom` starts the run.** It is live by the time `JoinRoom` resolves and the run's clock is already running. Load your level before calling `JoinRoom`, not between `JoinRoom` and gameplay.
 
 **Returns:** `Promise<RoomSessionData>` - The two identifiers that address this run. Keep both for the rest of the session lifecycle — every subsequent call (`EndRoomSP`, `GetLeaderboard`, `CreateSession_Client`) needs them.
 
@@ -1127,9 +1134,9 @@ public async EndRoomSP(
 **Parameters:**
 - `eventId` - Event/Room identifier (`RoomSessionData.EventId`).
 - `sessionOrMatchId` - Session identifier for this run (`RoomSessionData.SessionOrMatchId`).
-- `score` - The player's final score for this run.
+- `score` - The player's final score for this run. Fractional values are truncated toward zero (e.g. `47.9` is submitted as `47`).
 - `userId` - The player's SDK user identifier — `UserData.UserId` (not `PlatformId`).
-- `ip` - The player's IP address, recorded with the result for anti-cheat validation. Default: `"127.0.0.1"`.
+- `ip` - The player's IP address, sent with the result. Default: `"127.0.0.1"`.
 - `gameEvents` - Gameplay action log to submit alongside the score. When left empty, the SDK substitutes the events recorded during this session via `RecordEvent_Client`. Default: `[]`.
 
 **Returns:** `Promise<any>` - The backend's response to the score submission, returned untyped.
@@ -1166,7 +1173,7 @@ async gameOver() {
 
 **Important Notes:**
 - The score is final — the run cannot be re-submitted after a successful call.
-- `userId` must be the SDK user id (`UserData.UserId`); it is validated server-side.
+- `userId` must be the SDK user id (`UserData.UserId`), not `PlatformId`.
 
 ---
 
@@ -1220,7 +1227,7 @@ public async GetTournaments(page = 1, perPage = 100, filter?: TournamentsFilterE
 - `PlayerLimit` (`number | null`, optional) - Maximum number of distinct players who may join. `null` when the tournament is uncapped.
 - `EntryLimit` (`number`, optional) - Maximum number of scoring attempts a player may spend in this tournament.
 - `HavePassword` (`boolean | null`, optional) - Whether the tournament is password-protected. When `true`, `JoinTournament` requires the `password` argument.
-- `PrizePoolLabel` (`string`, optional) - Pre-formatted, human-readable prize-pool summary for display, e.g. `"50K TICO, Private Passes & More"`. Render it verbatim; it is not machine-parseable. For the structured table, call `GetPrizes`.
+- `PrizePoolLabel` (`string`, optional) - Pre-formatted, human-readable prize-pool summary for display, e.g. `"10K TICO & More"`. Render it verbatim; it is not machine-parseable. For the structured table, call `GetPrizes`.
 - `GuaranteedPrizePoolUsd` (`number`, optional) - Guaranteed prize-pool value in USD.
 - `Gpp` (`number | null`, optional) - Guaranteed prize pool as a raw number. `null` when the tournament advertises no guarantee.
 - `GppLabel` (`string | null`, optional) - Pre-formatted display label for `Gpp`. `null` when there is nothing to show.
@@ -1244,13 +1251,13 @@ const ongoing = await this.funtico.sdk.GetTournaments(1, 20, TournamentsFilterEn
 ongoing.forEach(t => {
   console.log(`${t.Name} — starts ${t.StartDate}, up to ${t.EntryLimit} entries`);
   console.log(`  ${t.PrizePoolLabel} — entry fee ${t.EntryFee}`);
-  // -> "Bottle Flip Tournament — starts 2026-05-14T21:00:00Z, up to 40 entries"
-  // -> "  50K TICO, Private Passes & More — entry fee 100"
+  // -> "Sample Tournament — starts 2030-01-01T12:00:00Z, up to 40 entries"
+  // -> "  10K TICO & More — entry fee 100"
 });
 
 // `Id` is the identifier every other tournament method accepts.
 const first = ongoing[0];
-console.log(first.Id);    // "a2361f35-a899-4d77-804b-e9c1aed5188a"
+console.log(first.Id);    // "00000000-0000-0000-0000-000000000000"
 console.log(first.Guid);  // same value
 ```
 
@@ -1336,7 +1343,7 @@ if (leaderboard.CurrentPlayer) {
 
 leaderboard.Players.forEach(p => {
   console.log(`#${p.Place} ${p.UserName} — ${p.Score}`);
-  // -> "#1 Kepsert — 11675"
+  // -> "#1 PlayerOne — 12345"
 });
 
 // Identity checks go through FunticoId, matched against PlatformId.
@@ -1452,7 +1459,7 @@ public async EnterTournament(tournamentId: string): Promise<TournamentEnterData>
 
 **TournamentEnterData Properties:**
 - `TournamentScoreUuid` (`string`) - **The `saveScoreId`.** Identifier of the tournament score record this attempt will be written to. Keep it for the whole run and pass it as the `saveScoreId` argument of `ResultTournament_Client` / `ResultTournament_Server`. It must be the value from the matching `EnterTournament` call.
-- `LocalTournamentUUID` (`string`) - The SDK-side row id for the attempt. Game code does not need it.
+- `LocalTournamentUUID` (`string`) - An internal identifier for the attempt. Game code does not need it.
 
 **Usage:**
 ```typescript
@@ -1475,7 +1482,7 @@ await sdk.ResultTournament_Client(t.Id, enter.TournamentScoreUuid, 9999, true);
 
 const board = await sdk.GetTournamentLeaderboard(t.Id);
 const me = board.CurrentPlayer;
-console.log(`Points ${me?.Points}, place ${me?.Place}`); // -> "Points 9999, place 2"
+console.log(`Points ${me?.Points}, place ${me?.Place}`); // -> "Points 9999, place 1"
 ```
 
 ---
@@ -1632,18 +1639,20 @@ public async ResultTournament_Server(
 **Parameters:**
 - `tournamentId` - Tournament UUID (`TournamentViewModel.Id`).
 - `saveScoreId` - The attempt identifier from `EnterTournament`: **`TournamentEnterData.TournamentScoreUuid`**.
-- `score` - The player's final score for this attempt.
+- `score` - The player's final score for this attempt. Sent as-is (unlike `ResultTournament_Client`, the SDK does not truncate it), so pass an integer.
 - `userId` - The player's identifier in the SDK system (`UserData.UserId`). Unlike the client method, the server call cannot infer the player from a JWT, so you must name them explicitly.
 - `isSuccess` - Whether the attempt completed properly. Pass `false` for an abandoned or invalidated run — the score is then discarded rather than ranked, and the attempt is closed out.
-- `ip` - The player's IP address, used for validation. Default: `"0.0.0.0"`. When left at the default the API substitutes the address it observed on the request.
+- `ip` - The player's IP address, sent with the result. Default: `"0.0.0.0"`. Leave it at the default when you do not know the player's address.
 
-**Returns:** `Promise<TournamentResultViewModel>` - The server's confirmation of what was recorded and awarded.
+**Returns:** `Promise<TournamentResultViewModel>` - The server's confirmation of the submitted result.
 
 **TournamentResultViewModel Properties:**
-- `Score` (`number`, optional) - The score the server actually recorded for the attempt.
-- `Time` (`number`, optional) - Duration of the attempt, in seconds.
-- `XpReceive` (`number`, optional) - Experience points awarded for the attempt.
-- `IcReceive` (`number`, optional) - In-game currency (`EntryFeeType.IC`, i.e. Coins) awarded for the attempt.
+- `Score` (`number`, optional) - Echo of the `score` you submitted. When `isSuccess` is `false` no score is recorded, but this field still returns the submitted value.
+- `Time` (`number`, optional) - Declared as the attempt duration in seconds.
+- `XpReceive` (`number`, optional) - Declared as the experience points awarded for the attempt.
+- `IcReceive` (`number`, optional) - Declared as the in-game currency (`EntryFeeType.IC`, i.e. Coins) awarded for the attempt.
+
+> **Note:** only `Score` is populated. `Time`, `XpReceive` and `IcReceive` are always `0`; do not rely on them as awarded XP or currency.
 
 **Usage:**
 ```typescript
@@ -1657,7 +1666,7 @@ const result = await FunticoSDK.Instance.ResultTournament_Server(
   player.ipAddress
 );
 
-console.log(`Recorded ${result.Score} — XP +${result.XpReceive}, IC +${result.IcReceive}`);
+console.log(`Recorded ${result.Score}`); // Time/XpReceive/IcReceive are always 0 today
 ```
 
 ---
@@ -1680,7 +1689,7 @@ public async ResultTournament_Client(
 **Parameters:**
 - `tournamentId` - Tournament UUID (`TournamentViewModel.Id`).
 - `saveScoreId` - The attempt identifier from `EnterTournament`: **`TournamentEnterData.TournamentScoreUuid`**. It must be the value from the `EnterTournament` call that opened this attempt.
-- `score` - The player's final score for this attempt.
+- `score` - The player's final score for this attempt. Fractional values are truncated toward zero (e.g. `47.9` is submitted as `47`).
 - `isSuccess` - Whether the attempt completed properly. Pass `false` for an abandoned run; the score is then discarded rather than ranked.
 - `customData` - Optional extra game data, as a string (serialize your own JSON). It is encrypted along with the score. Default: `""`.
 
@@ -1774,7 +1783,7 @@ The SDK translates `HallOfFameGameModeFilter` onto these values internally, so g
 - `limit` (`number`) - The entries-per-page value this response was built with (echoes the request).
 
 **HallOfFamePlayerEntry Properties:**
-- `userId` (`number`) - The player's SDK database user ID (the same identifier as `UserId` in user data).
+- `userId` (`number`) - The player's SDK user ID (the same identifier as `UserId` in user data).
 - `funticoId` (`number`) - The player's Funtico platform user ID (the same identifier as `PlatformId` / `FunticoUserId`).
 - `displayName` (`string`) - The player's public display name. Reads `"Unknown"` when no profile record can be resolved.
 - `avatarUrl` (`string | null`, optional) - URL of the player's avatar image, or `null` if they have none.
@@ -1783,7 +1792,7 @@ The SDK translates `HallOfFameGameModeFilter` onto these values internally, so g
 - `borderType` (`string | null`, optional) - The category of the equipped avatar border, used together with `avatarBorder` to render the frame. `null` if unset.
 - `country` (`string | null`, optional) - The player's country code, for flag display. `null` if not provided.
 - `rank` (`number`) - The player's 1-based position in the ranking under the active period and game mode filter.
-- `totalPoints` (`number`) - **The player's best single score, not a sum.** The backend ranks on the maximum score across the player's runs, so a player with one excellent run outranks a player with many mediocre ones. Label this in UI accordingly ("Best score", not "Total").
+- `totalPoints` (`number`) - **The player's best single score, not a sum.** The ranking uses the maximum score across the player's runs, so a player with one excellent run outranks a player with many mediocre ones. Label this in UI accordingly ("Best score", not "Total").
 - `gamesPlayed` (`number`) - How many ranked runs the player has recorded under the active filter. This is a count of results, and it does not feed into `totalPoints`.
 - `playedAt` (`string | null`, optional) - ISO-8601 timestamp of the run that produced `totalPoints` — i.e. when the best score was set, not when the player last played. `null` if no timestamp is available.
 
@@ -1887,7 +1896,7 @@ The typical flow is `IsCampaignAvailable` → `GetCampaignLevels` → `StartCamp
 
 **Stars are computed server-side.** The client reports metrics; the backend evaluates the level's star rules against them and answers with the stars earned. Render `StarRules` as UI ("finish under 60s for 2 stars"), but never compute stars yourself and never try to submit them — nothing the client sends can claim a star directly.
 
-**The metrics contract.** `CompleteCampaignLevel` takes a flat `name -> value` map (`CampaignMetrics`): 1-32 entries, each name 1-64 characters, each value a **finite number or a boolean**. Booleans are normalized to `1`/`0` for the wire. **Fractional numbers are allowed** — the backend stores metrics as doubles, so `time: 47.35` survives intact, unlike `EndRoomSP`'s `score`, which is an integer and gets truncated. Violations throw a `CampaignError` with `Code: InvalidMetrics` client-side, before anything is encrypted or sent.
+**The metrics contract.** `CompleteCampaignLevel` takes a flat `name -> value` map (`CampaignMetrics`): 1-32 entries, each name 1-64 characters, each value a **finite number or a boolean**. Booleans are normalized to `1`/`0` for the wire. **Fractional numbers are allowed** — `time: 47.35` survives intact, unlike `EndRoomSP`'s `score`, which the SDK truncates to an integer before sending. Violations throw a `CampaignError` with `Code: InvalidMetrics` client-side, before anything is encrypted or sent.
 
 **Failure model.** Campaign methods reject with a `CampaignError` carrying a machine-readable `Code` (see the [`CampaignError`](#campaignerror) block at the end of this section) — branch on the code, never on message text. Two outcomes are deliberately *not* errors: a game without a campaign reports `IsAvailable: false` as plain data, and a **lost run resolves normally** with `IsWin: false, Stars: 0`.
 
@@ -1899,7 +1908,7 @@ The typical flow is `IsCampaignAvailable` → `GetCampaignLevels` → `StartCamp
 
 Checks whether the game has a campaign configured, and its headline numbers, without fetching the full level list. Call it when building the main menu to decide whether to show the campaign entry at all.
 
-This is the one Campaign method that **works before authentication** — the endpoint is anonymous on the backend and only the game key is required, so even a pre-login menu can gate its campaign button on it. The JWT is attached when one exists, but its absence does not throw, unlike every other Campaign method.
+This is the one Campaign method that **works before authentication** — no player sign-in is needed and only the game key is required, so even a pre-login menu can gate its campaign button on it. The JWT is attached when one exists, but its absence does not throw, unlike every other Campaign method.
 
 **Signature:**
 ```typescript
@@ -2126,7 +2135,7 @@ public async StartCampaignLevel(levelId: string): Promise<CampaignAttemptData>
 **Re-starting replaces the tracked attempt.** Calling `StartCampaignLevel` again — for the same level or another — simply makes the new attempt the tracked one; the server abandons the old attempt, and there is nothing to clean up client-side.
 
 **CampaignAttemptData Properties:**
-- `AttemptId` (`string`) - The attempt's identifier. It also seeds the encryption key `CompleteCampaignLevel` derives.
+- `AttemptId` (`string`) - The attempt's identifier.
 - `LevelId` (`string`) - The level this attempt belongs to (echoes the request).
 - `ConfigVersion` (`number`) - The level-config version this attempt was started against. If it differs from the `ConfigVersion` you rendered, the level changed under you — refetch before playing.
 - `StartedAt` (`string`) - ISO-8601 timestamp of when the server started the attempt.
@@ -2200,12 +2209,12 @@ public async CompleteCampaignLevel(metrics: CampaignMetrics, attempt?: CampaignA
 ```
 
 **Parameters:**
-- `metrics` - Flat `name -> value` map of the run's results (`CampaignMetrics`). 1-32 entries; names 1-64 characters; values finite numbers or booleans. Booleans are sent as `1`/`0`; **fractional numbers pass through untruncated** (the backend stores doubles — this is unlike `EndRoomSP`'s integer score). A violation throws `CampaignError` with `Code: InvalidMetrics` before anything is sent.
+- `metrics` - Flat `name -> value` map of the run's results (`CampaignMetrics`). 1-32 entries; names 1-64 characters; values finite numbers or booleans. Booleans are sent as `1`/`0`; **fractional numbers pass through untruncated** (unlike `EndRoomSP`'s `score`, which the SDK truncates to an integer before sending). A violation throws `CampaignError` with `Code: InvalidMetrics` before anything is sent.
 - `attempt` - Optional attempt to submit against, e.g. one you persisted yourself across a reload. Omit it to use the attempt tracked by `StartCampaignLevel`. With neither, the method throws `CampaignError` with `Code: NoActiveAttempt` before any I/O. Completing an explicitly passed attempt never clobbers a **different** attempt the SDK is tracking — tracking is cleared only when it is the same attempt.
 
 **Returns:** `Promise<CampaignCompletionResult>` - The graded outcome. **A loss is a normal resolution** — `IsWin: false, Stars: 0` on a `200` — so render the defeat screen from this same object; only validation and state failures reject.
 
-The SDK encrypts and signs the payload for you (the same scheme as `EndRoomSP`, keyed on the attempt id) — pass plain metrics and never encrypt anything yourself. Events recorded via `RecordEvent_Client` are folded into the encrypted payload automatically.
+The SDK encrypts and signs the payload for you with your `privateGameKey` — pass plain metrics and never encrypt anything yourself. Events recorded via `RecordEvent_Client` are folded into the encrypted payload automatically.
 
 **Attempt handling on failure:** the tracked attempt is kept only for retryable failures — network errors and `Unknown` — so the game may retry the same submission after a blip. It is cleared for `AttemptNotFound` **and** `CompletionTooFast`: in both cases the server-side attempt is dead (unknown, or abandoned by the too-fast rejection itself), so a retry can never succeed and a fresh `StartCampaignLevel` is needed.
 
@@ -2229,7 +2238,7 @@ import { CampaignError, CampaignErrorCode } from './sdk/FunticoPhaserSDK';
 async onRunFinished(timeSeconds: number, coins: number, died: boolean) {
   try {
     const result = await this.funtico.sdk.CompleteCampaignLevel({
-      time: timeSeconds,     // fractional is fine - metrics are doubles
+      time: timeSeconds,     // fractional values are fine
       coins: coins,
       no_damage: !died       // booleans become 1/0 on the wire
     });
@@ -2314,17 +2323,17 @@ Use these methods in **client builds** (browser / Telegram Mini App) to make a m
 **The reconnection flow, end to end:**
 
 1. **Detect** — at boot, call `UserHasUnfinishedSession_Client()`. It returns every session the player started but never finished, each with a `ReconnectTime` budget in seconds.
-2. **Reconnect** — pick a session and pass its `Id` to `ReconnectToUnfinishedSession_Client(id)`. This tells the backend the player is coming back (it bumps the session's reconnect counter and its last-reconnect timestamp).
+2. **Reconnect** — pick a session and pass its `Id` to `ReconnectToUnfinishedSession_Client(id)`. This tells the backend the player is coming back.
 3. **Decrypt** — the same call transparently decrypts the stored `Data` blob and hands you back your original plaintext JSON string. You never call `CryptoHelper` yourself.
 4. **Resume** — `JSON.parse` the returned string to rebuild your game state, and rebuild the room identifiers from the session itself: `EventId` comes from `SessionId`, and `SessionOrMatchId` comes from `SaveSessionId`. The SDK re-arms its internal session tracking at this point, so `UpdateSession_Client` and `RecordEvent_Client` work immediately without re-creating anything.
 
 **Encryption:**
 
-Your state never travels or rests in plaintext — `CreateSession_Client` and `UpdateSession_Client` encrypt and sign it for you, and `ReconnectToUnfinishedSession_Client` decrypts it on the way back. The encryption key is derived per player, so the SDK must have user data cached before any of these calls; otherwise they throw `"User data is not loaded. Cannot derive session encryption key."` (`Initialize` pre-loads it for you when a `userToken` is supplied.)
+Your state never travels or rests in plaintext — `CreateSession_Client` and `UpdateSession_Client` encrypt and sign it for you, and `ReconnectToUnfinishedSession_Client` decrypts it on the way back. The SDK must have the player's user data cached before any of these calls; otherwise they throw `"User data is not loaded. Cannot derive session encryption key."` (`Initialize` pre-loads it for you when a `userToken` is supplied.)
 
 **How checkpoints are saved:**
 
-Call `CreateSession_Client` once, immediately after `JoinRoom` / `EnterTournament` and *before* gameplay starts — that way a player who never even finishes loading the scene can still reconnect. Then call `UpdateSession_Client` at your own checkpoints (a Phaser timer every few seconds, level transitions, or after each significant move). Each update overwrites the stored blob wholesale; there is no merge, so always pass a complete state snapshot. The reconnect window on the backend is 15 minutes from the moment the session was created — `ReconnectTime` is what remains of it. Once it lapses, the session is dropped server-side; a `Tournament` session that lapses is additionally auto-finalised with no score.
+Call `CreateSession_Client` once, immediately after `JoinRoom` / `EnterTournament` and *before* gameplay starts — that way a player who never even finishes loading the scene can still reconnect. Then call `UpdateSession_Client` at your own checkpoints (a Phaser timer every few seconds, level transitions, or after each significant move). Each update overwrites the stored blob wholesale; there is no merge, so always pass a complete state snapshot. The reconnect window is 15 minutes from the moment the session was created — `ReconnectTime` is what remains of it. Once it lapses, the session can no longer be resumed; a `Tournament` session that lapses is additionally auto-finalised with no score.
 
 ---
 
@@ -2340,7 +2349,7 @@ public async UserHasUnfinishedSession_Client(): Promise<UnfinishedSessionsRespon
 **Returns:** `Promise<UnfinishedSessionsResponse>` - A wrapper containing the list of resumable sessions. The list is empty when the player has nothing to resume. A player may have more than one entry — for example, an abandoned single-player room and an in-progress multiplayer match — so either let the player choose or pick one deliberately.
 
 **UnfinishedSessionsResponse Properties:**
-- `SavedSessions` (`SavedSessionResponse[]`) - Every session the player can still return to. Sessions whose reconnect window has already lapsed are purged by the backend rather than listed, so anything present here is genuinely resumable.
+- `SavedSessions` (`SavedSessionResponse[]`) - Every session the player can still return to. Sessions whose reconnect window has already lapsed are not listed, so anything present here is genuinely resumable.
 
 **SavedSessionResponse Properties:**
 - `Id` (`string`) - The session record's own unique identifier (a GUID). This is the handle you pass to `ReconnectToUnfinishedSession_Client` — it is *not* the room or match id.
@@ -2569,7 +2578,7 @@ this.funtico.sdk.CloseCurrentSession_Client();
 
 ### `RecordEvent_Client`
 
-Appends a gameplay event to the current session's event log. Record the actions that describe how a score came about — the backend replays this log to validate progression, so anti-cheat quality depends on games calling this consistently.
+Appends a gameplay event to the current session's event log. Record the actions that describe how a score came about; the log is submitted together with the result.
 
 **Signature:**
 ```typescript
@@ -2857,7 +2866,7 @@ public async refreshUserData(useCache = false): Promise<UserData>
 
 **UserData Properties:**
 - `Name` (`string`) - The player's display name / username.
-- `UserId` (`number`) - The player's identifier inside the SDK's own database. This is the value passed as `userId` to `EndRoomSP` and `ResultTournament_Server`.
+- `UserId` (`number`) - The player's SDK-side identifier. This is the value passed as `userId` to `EndRoomSP` and `ResultTournament_Server`.
 - `PlatformId` (`number`) - The player's identifier on the Funtico platform. Match leaderboard rows against this value.
 - `Level` (`number`) - The player's current level.
 - `Rating` (`number`) - The player's rating.
@@ -3180,7 +3189,7 @@ await fetch('/my-game-server/submit', {
 
 ### `PrizeUtils.calculatePrize`
 
-Computes the total TICO value of a room's **automated** prizes for a given deposit stake pool. Port of C# `PrizeUtils.CalculatePrize`. Use it to render a "prize value" figure from any `Prize[]` the SDK hands you.
+Computes the total TICO value of a room's **automated** prizes for a given deposit stake pool. Use it to render a "prize value" figure from any `Prize[]` the SDK hands you.
 
 The SDK calls this internally to produce `PrizePlaceViewModel.RewardFeeRatio`, `PrizePoolDistributionViewModel.TicoSharedViaPlaces` and `RoomLeaderboardViewModel.YourTicoEarnings`, so reach for it directly only when you are valuing a prize list yourself.
 
@@ -3201,7 +3210,7 @@ Every other type (`Item`, `Reward`, `External`, `Placeholder`, `GameManagedRewar
 
 **PrizeType Properties:**
 
-A string enum whose values map directly onto the Funtico backend enum, so the value equals its name on the wire.
+A string enum whose value equals its name on the wire.
 - `Item` (`'Item'`) - A platform inventory item awarded automatically. Carries `ItemId` and `Amount`.
 - `DepositStakePoolShare` (`'DepositStakePoolShare'`) - A percentage share of the pool built from players' deposit stakes.
 - `DepositStakePerPlayer` (`'DepositStakePerPlayer'`) - A flat deposit-stake payout granted per player, not a share of a pool.

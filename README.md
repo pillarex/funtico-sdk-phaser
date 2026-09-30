@@ -152,7 +152,7 @@ const tier = await this.funtico.sdk.GetTierByEventId("event-guid");
      score,
      user.UserId,
      "127.0.0.1",
-     ["start_game", "score_updated"] // Action logs used for anti-cheat validation
+     ["start_game", "score_updated"] // Optional gameplay event log
    );
    ```
 3. **GetLeaderboard**: Reads the final standings and the player's own payout.
@@ -186,14 +186,14 @@ const tournaments = await this.funtico.sdk.GetTournaments(1, 100, TournamentsFil
 const t = tournaments[0];
 console.log(`${t.Name} — starts ${t.StartDate}, up to ${t.EntryLimit} entries`);
 console.log(`${t.PrizePoolLabel} — entry fee ${t.EntryFee}`);
-// -> "Bottle Flip Tournament — starts 2026-05-14T21:00:00Z, up to 40 entries"
-// -> "50K TICO, Private Passes & More — entry fee 100"
+// -> "Example Tournament — starts 2026-01-01T12:00:00Z, up to 40 entries"
+// -> "10K TICO & More — entry fee 100"
 
 // t.Id is the tournament identifier every other tournament method accepts.
 const leaderboard = await this.funtico.sdk.GetTournamentLeaderboard(t.Id);
 
 leaderboard.Players.forEach(p => console.log(`#${p.Place} ${p.UserName} — ${p.Score}`));
-// -> "#1 Kepsert — 11675"
+// -> "#1 PlayerOne — 11675"
 
 // Match players by FunticoId, which is a platform id.
 const me = this.funtico.sdk.GetCachedUserData();
@@ -339,7 +339,7 @@ for (const level of campaign.Levels) {
 
 ### Step 3 — Parse the Level Config with Your Own Type
 ```typescript
-// The schema is your game's - the platform stores the string untouched
+// The schema is your game's - the config string is returned exactly as authored
 interface MyLevelConfig {
   enemyWaves: number;
   timeLimitSeconds: number;
@@ -578,8 +578,8 @@ Because the plugin's `init()` swallows the rejection and still resolves, the SDK
 
 ### HTTP 500 `Padding is invalid and cannot be removed` on `/Rooms/end-room-sp`
 
-Authentication, `JoinRoom` and the match itself work, but `EndRoomSP` fails with HTTP 500 and the server reports `Padding is invalid and cannot be removed` (from `AESNonDynamic.Decrypt`).
+Authentication, `JoinRoom` and the match itself work, but `EndRoomSP` fails with HTTP 500 and the message `Padding is invalid and cannot be removed`.
 
-**Cause:** a wrong `privateGameKey`. The score payload is AES-encrypted with a key built from the first 8 characters of `privateGameKey` and signed with an HMAC keyed by the rest of it. The server decrypts before it checks the signature, so a wrong key surfaces as this padding error rather than as a hash mismatch (a padding error means a wrong key, never a wrong IV). The typical case is `privateGameKey` set to the public key and the secret key concatenated (`publicKey + secretKey`), which puts the public key's first 8 characters into the AES key. `ResultTournament_Client` derives its keys the same way and fails the same way. `CompleteCampaignLevel` also uses these keys, but the campaign server checks the signature before it decrypts, so there a wrong key never produces this 500: the call rejects with a `CampaignError` whose `Code` is `InvalidSignature` (or, rarely, `InvalidMetrics` with "Failed to decrypt result data." when only the first 8 characters of the key are wrong; see [`CampaignError`](./USAGE.md#campaignerror) in USAGE.md).
+**Cause:** a wrong `privateGameKey`. The SDK encrypts and signs the score payload with `privateGameKey`; on this endpoint this error means the key is wrong. The typical case is `privateGameKey` set to the public key and the secret key concatenated (`publicKey + secretKey`). `ResultTournament_Client` fails the same way with a wrong key. `CompleteCampaignLevel` also uses `privateGameKey`, but a wrong key does not produce this 500 there: the call rejects with a `CampaignError` whose `Code` is `InvalidSignature` (or, rarely, `InvalidMetrics` with "Failed to decrypt result data."; see [`CampaignError`](./USAGE.md#campaignerror) in USAGE.md).
 
-**Fix:** pass only the secret key from the Developer Portal in `privateGameKey`, and the public key alone in `publicGameKey`. The concatenated and identical-keys cases are now caught at `Initialize` with an `Invalid FunticoConfig` error (see above), so if this 500 still appears, the private key is some other wrong value — for example the key of a different game or environment (staging vs prod).
+**Fix:** pass only the secret key from the Developer Portal in `privateGameKey`, and the public key alone in `publicGameKey`. The concatenated and identical-keys cases are caught at `Initialize` with an `Invalid FunticoConfig` error (see above), so if this 500 still appears, the private key is some other wrong value — for example the key of a different game or environment (staging vs prod).
