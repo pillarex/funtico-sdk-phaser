@@ -1481,10 +1481,88 @@ export class FunticoSDK {
   }
 
   /**
+   * Fail-fast sanity check of the game keys, run before Initialize touches any state.
+   *
+   * A bad key does not fail where it is passed in: the public key only fails at the first request
+   * (auth rejected), and a bad private key survives even that - it is only used to encrypt/sign
+   * payloads. A secret for the wrong game/environment usually fails at the first encrypted call
+   * (e.g. CreateSession_Client), but the concatenated-keys incident keeps the last 8 characters
+   * that sessions use, so there the first symptom is an opaque HTTP 500 ("Padding is invalid and
+   * cannot be removed") from the server's AESNonDynamic.Decrypt on /Rooms/end-room-sp, after a
+   * whole match has been played. Every rule below catches a mistake that can NEVER work, so it is
+   * reported up front with a readable message instead.
+   *
+   * Deliberately NO format rules (GUID shape, charset, exact length): secret keys are inserted into
+   * the DB by hand, and public keys are GUIDs on legacy games but URL-safe base64 on new ones. A
+   * rule here must never reject a key the server legitimately issued.
+   *
+   * Messages never contain the key values themselves (they end up in logs and error trackers);
+   * lengths are fine.
+   *
+   * @throws Error whose message starts with "Invalid FunticoConfig: ".
+   */
+  private static validateConfig(config: FunticoConfig): void {
+    const fail = (reason: string): never => {
+      throw new Error(`Invalid FunticoConfig: ${reason}`);
+    };
+
+    if (config === null || typeof config !== "object") {
+      fail("config must be an object with at least publicGameKey and privateGameKey.");
+    }
+
+    const { publicGameKey, privateGameKey } = config;
+
+    if (typeof publicGameKey !== "string" || publicGameKey.length === 0) {
+      fail("publicGameKey is missing or empty. Pass the public key from the Developer Portal.");
+    }
+    if (typeof privateGameKey !== "string" || privateGameKey.length === 0) {
+      fail("privateGameKey is missing or empty. Pass the secret key from the Developer Portal.");
+    }
+
+    // No issued key has surrounding whitespace; it is almost always a stray newline/CR (or a BOM)
+    // from a .env file or a copy-paste. In privateGameKey it silently changes the derived
+    // AES/HMAC/session keys, so the server cannot decrypt. In publicGameKey the effect is less
+    // uniform: fetch strips leading/trailing space/tab/CR/LF from the X-User-Key header value, so
+    // ordinary requests would still work, but the untrimmed key feeds the X-Server-Key HMAC
+    // (getServerHeaders), and a BOM or other non-ASCII whitespace (which trim() also catches) makes
+    // fetch throw on the header. Both keys are rejected so a broken .env fails fast and consistently.
+    // Note: a publicGameKey with a trailing newline used to work for plain requests and is now
+    // rejected here.
+    if (publicGameKey !== publicGameKey.trim()) {
+      fail("publicGameKey has leading or trailing whitespace (a stray newline/CR from a .env file or copy-paste?). Trim it.");
+    }
+    if (privateGameKey !== privateGameKey.trim()) {
+      fail("privateGameKey has leading or trailing whitespace (a stray newline/CR from a .env file or copy-paste?). Trim it.");
+    }
+
+    // The server derives every payload key with SecretKey.Substring(0, 8), and the client mirrors it
+    // (AES key = id prefix + privateGameKey[0..8], HMAC key = privateGameKey[8..]). A shorter key
+    // throws on the server for every encrypted request, so it can never work.
+    if (privateGameKey.length < 8) {
+      fail(`privateGameKey is too short (${privateGameKey.length} characters, at least 8 required). Pass the full secret key from the Developer Portal.`);
+    }
+
+    if (privateGameKey === publicGameKey) {
+      fail("privateGameKey is the same as publicGameKey. Pass the secret key from the Developer Portal in privateGameKey, not the public key.");
+    }
+
+    // Auth still works (it only uses the public key), but the AES key becomes the first 8 chars of
+    // the PUBLIC key and the HMAC key is shifted too, so the server fails to decrypt with a 500
+    // "Padding is invalid" on end-room-sp. Containment in either direction means the fields were mixed.
+    if (privateGameKey.includes(publicGameKey) || publicGameKey.includes(privateGameKey)) {
+      fail(`privateGameKey and publicGameKey overlap (privateGameKey is ${privateGameKey.length} characters, publicGameKey is ${publicGameKey.length}); the keys look concatenated or pasted into one field. Pass only the secret key from the Developer Portal in privateGameKey, and the public key alone in publicGameKey.`);
+    }
+  }
+
+  /**
    * Initializes the Funtico SDK.
    * Automatically performs user authentication if token is provided.
+   *
+   * The config is validated first (see validateConfig); a rejected config throws before any state
+   * is changed, so a previously initialized SDK keeps working with its old config.
    */
   public async Initialize(config: FunticoConfig): Promise<void> {
+    FunticoSDK.validateConfig(config);
     this.config = config;
     
     if (config.apiBaseUrl) {

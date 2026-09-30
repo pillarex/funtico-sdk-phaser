@@ -43,12 +43,12 @@ export interface FunticoConfig {
 
 **FunticoConfig Properties:**
 - `env` (`FunticoEnvironment`) - Which Funtico backend the SDK talks to. Selects the default API base URL (see the `FunticoEnvironment` block below). Ignored for URL resolution when `apiBaseUrl` is supplied, but still stored on the config.
-- `privateGameKey` (`string`) - Your game's secret key from the Funtico Developer Portal. Used to sign and encrypt payloads. Never ship it in a public client build.
+- `privateGameKey` (`string`) - Your game's secret key from the Funtico Developer Portal. Used to sign and encrypt payloads. Never ship it in a public client build. Pass the secret key alone — never concatenated with the public key; `Initialize` rejects that (see [`Initialize`](#initialize) → **Throws**).
 - `publicGameKey` (`string`) - Your game's public key from the Funtico Developer Portal, sent with every request.
 - `userToken` (`string`, optional) - The player's platform token issued by the Funtico platform (in a web/Telegram Mini App build this usually arrives as a query parameter). When present, `Initialize` authenticates with it automatically and pre-warms the caches. When omitted, `Initialize` only resolves the base URL and you must call `Authentication` yourself before any authenticated method.
 - `apiBaseUrl` (`string`, optional) - Explicit base URL for the API gateway, without a trailing slash. When set, it **completely overrides** the environment-derived URL: `env` no longer decides where requests go. Use it to point the SDK at your own gateway, a regional deployment, or a local backend during development. Every SDK request is built as `${apiBaseUrl}/Controller/route`.
 - `funticoApiBaseUrl` (`string`, optional) - Explicit base URL for the Funtico **platform** API, without a trailing slash. This is a **different host** from `apiBaseUrl`: `apiBaseUrl` is your game's Rooms API and takes the game JWT, while this one is the platform itself and takes the player's platform token (`userToken`). `GetLeaderboard` calls it to resolve player names, avatars and borders. Like `apiBaseUrl`, when set it completely overrides the environment-derived URL; otherwise `env` selects it — `staging` → `https://staging.api.funtico.com`, `prod` → `https://api.funtico.com`.
-- `cacheTTL` (`number`, optional) - Lifetime in milliseconds of the shared client-side cache backing `GetUserData`, `GetBalance` and `GetVouchers`. While the cache is fresh, calls made with `useCache = true` return the stored copy with no network round-trip; once the window elapses, the next cached call refetches. Falsy values (including `0`) fall back to the default. Default: `30000` (30 seconds).
+- `cacheTTL` (`number`, optional) - Lifetime in milliseconds of the shared client-side cache backing `GetUserData`, `GetBalance`, `GetVouchers`, `GetCampaignAvailability` and `GetCampaignLevels`. While the cache is fresh, calls made with `useCache = true` return the stored copy with no network round-trip; once the window elapses, the next cached call refetches. Falsy values (including `0`) fall back to the default. Default: `30000` (30 seconds).
 
 **Usage:**
 ```typescript
@@ -132,13 +132,31 @@ public async Initialize(config: FunticoConfig): Promise<void>
 **Returns:** `Promise<void>` - Resolves once the base URL is resolved and — if `config.userToken` was supplied — authentication has completed and the cache pre-warm has settled.
 
 **What it does, in order:**
-1. Stores `config` on the instance, so `publicGameKey`, `privateGameKey` and `cacheTTL` are available to every later call.
-2. Resolves the API base URL: `config.apiBaseUrl` if provided, otherwise `https://funtico-sdk-staging.azurewebsites.net` for `FunticoEnvironment.STAGING` or `https://funtico-sdk.azurewebsites.net` for `FunticoEnvironment.PROD`.
-3. Resolves the Funtico **platform** base URL separately: `config.funticoApiBaseUrl` if provided, otherwise `https://staging.api.funtico.com` for `STAGING` or `https://api.funtico.com` for `PROD`. This is the host `GetLeaderboard` reads player names and avatars from; it is not the same host as the one in step 2.
-4. If `config.userToken` is set, awaits `Authentication(config.userToken)` to exchange the platform token for the game JWT.
-5. Warms the caches by awaiting `Promise.allSettled([GetUserData(false), GetBalance(false), GetVouchers(false)])`. All three run concurrently with `useCache = false`, so they hit the network in parallel rather than in sequence. Because it is `allSettled` and not `all`, a failure in any one of the three does **not** reject `Initialize` — the other two still populate their caches, and the failed one simply leaves its cache empty until the next call. `GetCachedUserData()`, `GetCachedBalance()` and `GetCachedVouchers()` return `null` for whatever did not load.
+1. Validates the game keys in `config` (see **Throws** below). If any check fails, `Initialize` rejects right here: nothing is stored and no request is sent.
+2. Stores `config` on the instance, so `publicGameKey`, `privateGameKey` and `cacheTTL` are available to every later call.
+3. Resolves the API base URL: `config.apiBaseUrl` if provided, otherwise `https://funtico-sdk-staging.azurewebsites.net` for `FunticoEnvironment.STAGING` or `https://funtico-sdk.azurewebsites.net` for `FunticoEnvironment.PROD`.
+4. Resolves the Funtico **platform** base URL separately: `config.funticoApiBaseUrl` if provided, otherwise `https://staging.api.funtico.com` for `STAGING` or `https://api.funtico.com` for `PROD`. This is the host `GetLeaderboard` reads player names and avatars from; it is not the same host as the one in step 3.
+5. If `config.userToken` is set, awaits `Authentication(config.userToken)` to exchange the platform token for the game JWT.
+6. Warms the caches by awaiting `Promise.allSettled([GetUserData(false), GetBalance(false), GetVouchers(false)])`. All three run concurrently with `useCache = false`, so they hit the network in parallel rather than in sequence. Because it is `allSettled` and not `all`, a failure in any one of the three does **not** reject `Initialize` — the other two still populate their caches, and the failed one simply leaves its cache empty until the next call. `GetCachedUserData()`, `GetCachedBalance()` and `GetCachedVouchers()` return `null` for whatever did not load.
 
-If `config.userToken` is omitted, steps 4 and 5 are skipped entirely: the SDK is configured but unauthenticated, and authenticated methods will throw `"SDK is not authenticated. Call Initialize() or Authentication() first."` until `Authentication` is called. Authentication failure inside step 4 propagates out of `Initialize` as a rejected promise, so wrap the call in `try/catch` (the `FunticoPhaserPlugin.init` wrapper catches it for you and logs to the console).
+If `config.userToken` is omitted, steps 5 and 6 are skipped entirely: the SDK is configured but unauthenticated, and authenticated methods will throw `"SDK is not authenticated. Call Initialize() or Authentication() first."` until `Authentication` is called. Authentication failure inside step 5 propagates out of `Initialize` as a rejected promise, so wrap the call in `try/catch` (the `FunticoPhaserPlugin.init` wrapper catches it for you and logs to the console).
+
+**Throws:**
+
+`Initialize` checks the game keys before it touches any state and rejects with a plain `Error` whose message starts with `"Invalid FunticoConfig: "` followed by the reason. Because the method is `async`, the error arrives as a rejected promise — catch it with `try/catch` around `await` (or `.catch()`). A call rejected by this validation leaves the SDK exactly as it was: an instance that was already initialized keeps its previous config, JWT and caches, and keeps working.
+
+`Initialize` also rejects when `config.userToken` is supplied and the token exchange in step 5 fails (`Error("Funtico Authentication failed: <body>")`, or a fetch network error such as a `TypeError` when the API host is unreachable). Those failures happen **after** steps 2–4, so the new config and both base URLs are already stored while any previous JWT and caches are kept: the instance is left with the new config and the old token. Call `Initialize` or `Authentication` again before relying on it. Cache warm-up failures (step 6) never reject.
+
+The config is rejected when:
+- `config` is missing or not an object.
+- `publicGameKey` is missing, not a string, or empty.
+- `privateGameKey` is missing, not a string, or empty.
+- Either key has leading or trailing whitespace. No issued key has any; it is almost always a stray newline/CR from a `.env` file or a copy-paste. In `privateGameKey` it would silently change the derived encryption keys, so trim the value where you read it.
+- `privateGameKey` is shorter than 8 characters. The server derives every encrypted payload's key with `SecretKey.Substring(0, 8)` (and the SDK mirrors it: AES key = id prefix + `privateGameKey[0..8]`, HMAC key = `privateGameKey[8..]`), so a shorter key can never work.
+- `privateGameKey` is identical to `publicGameKey`.
+- One key contains the other (`privateGameKey` contains `publicGameKey`, or the reverse). This means the keys were concatenated or pasted into one field — for example `privateGameKey: publicKey + secretKey`. Such a config authenticates fine (authentication only uses the public key), but the AES key is then built from the first 8 characters of the **public** key and the HMAC key is shifted too, so the server cannot decrypt encrypted submissions — on `/Rooms/end-room-sp` this surfaces as HTTP 500 `"Padding is invalid and cannot be removed"`, after a whole match has been played. Pass only the secret key from the Developer Portal in `privateGameKey`, and the public key alone in `publicGameKey`.
+
+These are the only checks. There are deliberately no format rules beyond them (no GUID shape, charset or exact-length checks): public keys are GUIDs on older games and URL-safe base64 on newer ones, and a check must never reject a key the Developer Portal legitimately issued. The error messages never include the key values themselves — at most their lengths — so they are safe to forward to logs and error trackers.
 
 **Usage:**
 ```typescript
@@ -269,11 +287,11 @@ this.game.events.on(FunticoPhaserPlugin.EVENTS.AUTHENTICATED, (jwt: string) => {
 
 These methods expose the authenticated player's profile, balance, and vouchers. Most of them read through a shared in-memory cache so that UI code can poll them cheaply without hammering the API; `CanAfford` is the exception and deliberately bypasses it.
 
-**Caching model.** The SDK keeps three separate cache slots (user data, balance, vouchers) and a single shared expiry timestamp, `cacheExpiresAt`. The window length comes from `FunticoConfig.cacheTTL` (milliseconds, default `30000`). The `useCache = true` overload of `GetUserData`, `GetBalance`, and `GetVouchers` returns the cached value only when that slot has been filled **and** `Date.now()` is still below `cacheExpiresAt`; otherwise it performs a fresh request and refills the slot. Passing `useCache = false` always goes to the network and refreshes that slot.
+**Caching model.** The SDK keeps five separate cache slots (user data, balance, vouchers, campaign availability, campaign levels) and a single shared expiry timestamp, `cacheExpiresAt`. The window length comes from `FunticoConfig.cacheTTL` (milliseconds, default `30000`). The `useCache = true` overload of `GetUserData`, `GetBalance`, `GetVouchers`, `GetCampaignAvailability`, and `GetCampaignLevels` returns the cached value only when that slot has been filled **and** `Date.now()` is still below `cacheExpiresAt`; otherwise it performs a fresh request and refills the slot. Passing `useCache = false` always goes to the network and refreshes that slot.
 
-The expiry timestamp is shared, and **any** of the three re-arms it when it fetches: a refresh of one slot extends the window that the other two are checked against. So a slot can outlive its own TTL if a sibling keeps refreshing — e.g. `GetRooms` force-refreshes vouchers on every call, which also slides the window for a `GetUserData` copy that has not been refetched. Treat `cacheTTL` as "how long after the *last fetch of anything* the caches stay valid", not as a per-slot age limit. If you need a guaranteed-fresh value, pass `useCache = false` rather than relying on the window to have lapsed.
+The expiry timestamp is shared, and **any** of the five re-arms it when it fetches: a refresh of one slot extends the window that the others are checked against (a campaign fetch slides the window for the account slots too, and the reverse). So a slot can outlive its own TTL if a sibling keeps refreshing — e.g. `GetRooms` force-refreshes vouchers on every call, which also slides the window for a `GetUserData` copy that has not been refetched. Treat `cacheTTL` as "how long after the *last fetch of anything* the caches stay valid", not as a per-slot age limit. If you need a guaranteed-fresh value, pass `useCache = false` rather than relying on the window to have lapsed.
 
-`Initialize()` pre-warms all three slots with `useCache = false` when a `userToken` is supplied in the config, so cached getters are usually populated by the time the first scene runs.
+`Initialize()` pre-warms the three account slots (user data, balance, vouchers) with `useCache = false` when a `userToken` is supplied in the config, so cached getters are usually populated by the time the first scene runs. The campaign slots are filled on first use.
 
 The `GetCachedX()` variants never touch the network and never inspect the expiry timestamp — they return whatever is currently in the slot, or `null` if nothing has been cached yet.
 
@@ -1047,7 +1065,7 @@ public async JoinRoom(roomGuid: string, useVoucher?: boolean): Promise<RoomSessi
 ```
 
 **Parameters:**
-- `roomGuid` - Room unique identifier (`RoomViewModel.Guid`). Sent in the request body as `TournamentId`.
+- `roomGuid` - Room unique identifier (`RoomViewModel.Guid`). Sent in the request body as `tournamentId`.
 - `useVoucher` - Whether to spend a free-entry voucher instead of paying the entry fee. **Omit it** to let the SDK decide: it looks the room up and uses its `UserCanJoinWithVoucher`. Pass `true`/`false` only to override that decision — passing `true` when the player holds no activated voucher gets the join rejected. Omitting it costs one extra request; passing it explicitly skips that lookup.
 
 **`JoinRoom` starts the run.** It is live by the time `JoinRoom` resolves and the server-side timers are already ticking. Load your level before calling `JoinRoom`, not between `JoinRoom` and gameplay.
@@ -2730,7 +2748,7 @@ public async init(config: FunticoConfig): Promise<void>
 - `publicGameKey` (`string`) - Your game's public key from the Funtico Developer Portal, sent with every request.
 - `userToken` (`string`, optional) - The player's Funtico platform token. When present, `Initialize` immediately authenticates the player and pre-loads user data, balance and vouchers, so cached getters work right after `init` resolves. Omit it to initialize the SDK unauthenticated and call `login()` later.
 - `apiBaseUrl` (`string`, optional) - Overrides the environment-derived API host. Point this at your game's own API gateway if you proxy Funtico requests. Default: `https://funtico-sdk-staging.azurewebsites.net` for `STAGING`, `https://funtico-sdk.azurewebsites.net` for `PROD`.
-- `cacheTTL` (`number`, optional) - Lifetime of the user-data / balance / voucher cache, in milliseconds. Once expired, calls with `useCache = true` hit the network again. Default: `30000`.
+- `cacheTTL` (`number`, optional) - Lifetime of the user-data / balance / voucher / campaign cache, in milliseconds. Once expired, calls with `useCache = true` hit the network again. Default: `30000`.
 
 **Emits:**
 - `EVENTS.INITIALIZED` - Always, once `sdk.Initialize(config)` resolves.
@@ -2770,6 +2788,8 @@ export class BootScene extends Phaser.Scene {
 
 **Important Notes:**
 - `init()` **catches and logs initialization errors instead of throwing.** Any failure inside `sdk.Initialize(config)` is swallowed and written to the console as `[FunticoPhaserPlugin] Initialization error: ...`, and the returned promise still resolves. `await this.funtico.init(...)` therefore never rejects, and a `try/catch` around it will not fire.
+- This includes config validation. An invalid config (see [`Initialize`](#initialize) → **Throws**) shows up only as the console error `[FunticoPhaserPlugin] Initialization error: Error: Invalid FunticoConfig: ...`, while `init()` still resolves and `EVENTS.INITIALIZED` is not emitted. If you need to catch it — for example to show a configuration error instead of failing silently — call `FunticoSDK.Instance.Initialize(config)` directly inside `try/catch`.
+- After a swallowed failure the SDK stays uninitialized, so the next calls fail with their own, less helpful errors: `login()` (`Authentication`), `GetRoomPublic` and `GetCampaignAvailability` throw `TypeError: Cannot read properties of undefined (reading 'publicGameKey')`, and calls that need a JWT throw `"SDK is not authenticated..."`. If you see either, look earlier in the console for the `[FunticoPhaserPlugin] Initialization error` line.
 - Because failures are silent, do not treat a resolved `init()` as proof of success. Detect failure either by listening for `EVENTS.INITIALIZED` (never emitted if `Initialize` threw) or by checking `this.funtico.sdk.getUserToken()` for a non-empty JWT afterwards.
 - The unwrapped `FunticoSDK.Instance.Initialize(config)` **does** throw. Use it directly if you want to handle initialization errors yourself.
 

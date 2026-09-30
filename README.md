@@ -22,6 +22,7 @@ The SDK covers rooms and tournament management, special tournaments, the Hall of
 7. [Campaign Mode](#7-campaign-mode)
 8. [Session Reconnection & Progress Saving](#8-session-reconnection--progress-saving)
 9. [Complete Phaser 3 Scenes Example](#9-complete-phaser-3-scenes-example)
+10. [Troubleshooting](#10-troubleshooting)
 
 ---
 
@@ -93,6 +94,10 @@ await this.funtico.init({
 ```
 
 Both URL overrides are optional — `env` resolves each to the right default. Note they are **two different hosts**: `apiBaseUrl` is your game's Rooms API and takes the game JWT, while `funticoApiBaseUrl` is the Funtico platform itself and takes the player's platform token. The leaderboard reads player names and avatars from the latter.
+
+> **Key validation:** `Initialize` checks both keys before sending any request and rejects with an `Error` whose message starts with `"Invalid FunticoConfig: "` when a key is missing or empty, has leading/trailing whitespace (a stray newline from a `.env` file), `privateGameKey` is shorter than 8 characters, or the two keys are identical or one contains the other (they were concatenated into one field). Pass **only** the secret key from the Developer Portal in `privateGameKey`. A rejected config changes nothing, and the message never echoes the key values.
+>
+> `this.funtico.init()` catches this like any other initialization error: it only logs `[FunticoPhaserPlugin] Initialization error: Error: Invalid FunticoConfig: ...` and still resolves. Call `FunticoSDK.Instance.Initialize(config)` directly inside `try/catch` if you want to handle it. See [USAGE.md](./USAGE.md#initialize) for the full rules.
 
 ---
 
@@ -560,3 +565,21 @@ export class GameScene extends Phaser.Scene {
   }
 }
 ```
+
+---
+
+## 10. Troubleshooting
+
+### `Invalid FunticoConfig: ...` at startup
+
+`Initialize` rejected your config before sending any request; the rest of the message says which check failed and how to fix it. Through the plugin it appears only in the console, as `[FunticoPhaserPlugin] Initialization error: Error: Invalid FunticoConfig: ...`. The usual causes are the two keys concatenated into one field, the same key passed in both fields (for example the public key also used as `privateGameKey`), or a value read from a `.env` file that kept its trailing newline. Swapped keys are not detected here; they show up later as an authentication or request failure. See [USAGE.md](./USAGE.md#initialize) for every rule.
+
+Because the plugin's `init()` swallows the rejection and still resolves, the SDK is left uninitialized, and the next calls fail with their own errors. `this.funtico.login()` / `Authentication`, `GetRoomPublic` and `GetCampaignAvailability` throw `TypeError: Cannot read properties of undefined (reading 'publicGameKey')`, and calls that need a JWT throw `SDK is not authenticated`. Either error means `Initialize` never succeeded (it was not called, or it rejected): look earlier in the console for the `[FunticoPhaserPlugin] Initialization error: ...` line.
+
+### HTTP 500 `Padding is invalid and cannot be removed` on `/Rooms/end-room-sp`
+
+Authentication, `JoinRoom` and the match itself work, but `EndRoomSP` fails with HTTP 500 and the server reports `Padding is invalid and cannot be removed` (from `AESNonDynamic.Decrypt`).
+
+**Cause:** a wrong `privateGameKey`. The score payload is AES-encrypted with a key built from the first 8 characters of `privateGameKey` and signed with an HMAC keyed by the rest of it. The server decrypts before it checks the signature, so a wrong key surfaces as this padding error rather than as a hash mismatch (a padding error means a wrong key, never a wrong IV). The typical case is `privateGameKey` set to the public key and the secret key concatenated (`publicKey + secretKey`), which puts the public key's first 8 characters into the AES key. `ResultTournament_Client` derives its keys the same way and fails the same way. `CompleteCampaignLevel` also uses these keys, but the campaign server checks the signature before it decrypts, so there a wrong key never produces this 500: the call rejects with a `CampaignError` whose `Code` is `InvalidSignature` (or, rarely, `InvalidMetrics` with "Failed to decrypt result data." when only the first 8 characters of the key are wrong; see [`CampaignError`](./USAGE.md#campaignerror) in USAGE.md).
+
+**Fix:** pass only the secret key from the Developer Portal in `privateGameKey`, and the public key alone in `publicGameKey`. The concatenated and identical-keys cases are now caught at `Initialize` with an `Invalid FunticoConfig` error (see above), so if this 500 still appears, the private key is some other wrong value — for example the key of a different game or environment (staging vs prod).
