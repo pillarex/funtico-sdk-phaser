@@ -1427,6 +1427,7 @@ export class FunticoSDK {
   private activeClientSessionId: string | null = null; // Stored eventId
   private currentClientSessionId: string | null = null; // Stored saveSessionId
   private currentClientSessionEvents: string[] = [];
+  private currentClientSessionCollected: Map<string, number> = new Map();
 
   // Campaign attempt tracking (client-side only; set by StartCampaignLevel)
   private activeCampaignAttempt: CampaignAttemptData | null = null;
@@ -2302,7 +2303,8 @@ export class FunticoSDK {
       Score: Math.trunc(score),
       UserId: userId,
       Ip: ip,
-      GameEvents: gameEvents.length > 0 ? gameEvents : this.currentClientSessionEvents
+      GameEvents: gameEvents.length > 0 ? gameEvents : this.currentClientSessionEvents,
+      ...this.getCollectedPayload()
     };
 
     const plainText = JSON.stringify(scorePayload);
@@ -2538,7 +2540,8 @@ export class FunticoSDK {
       Score: Math.trunc(score),
       IsSuccess: isSuccess,
       CustomData: customData,
-      GameEvents: this.currentClientSessionEvents
+      GameEvents: this.currentClientSessionEvents,
+      ...this.getCollectedPayload()
     };
 
     const plainText = JSON.stringify(scorePayload);
@@ -3062,6 +3065,7 @@ export class FunticoSDK {
     this.activeClientSessionId = data.SessionId;
     this.currentClientSessionId = data.SaveSessionId;
     this.currentClientSessionEvents = []; // clean logs to record new events during resume
+    this.currentClientSessionCollected.clear();
     
     return decryptedState;
   }
@@ -3072,6 +3076,10 @@ export class FunticoSDK {
     eventId: string,
     saveSessionId: string
   ): Promise<SavedSessionResponse> {
+    // Before the first await: the run is already live, and a pickup must not be wiped when the
+    // request returns.
+    this.currentClientSessionCollected.clear();
+
     // Encrypt custom data before storing
     const encryptionKey = this.getSessionEncryptionKey();
     const encryptedData = await CryptoHelper.encrypt(json, encryptionKey);
@@ -3133,6 +3141,7 @@ export class FunticoSDK {
     this.activeClientSessionDbId = null;
     this.activeClientSessionId = null;
     this.currentClientSessionId = null;
+    this.currentClientSessionCollected.clear();
     this.currentClientSessionEvents = [];
   }
 
@@ -3142,6 +3151,40 @@ export class FunticoSDK {
 
   public GetCurrentSessionEvents_Client(): string[] {
     return [...this.currentClientSessionEvents];
+  }
+
+  /**
+   * Counts an item the player collected during the current run, such as a chest. The counts are
+   * sent with the result by EndRoomSP and ResultTournament_Client, also when the run was lost.
+   *
+   * @param key The reward key agreed for your game, for example "chest_1".
+   * @param count How many to add. Use it to re-record what a resumed run had collected.
+   */
+  public RecordCollected_Client(key: string, count = 1): void {
+    if (!key || !Number.isInteger(count) || count <= 0) {
+      console.error(`RecordCollected_Client ignored an invalid call: key "${key}", count ${count}.`);
+      return;
+    }
+    this.currentClientSessionCollected.set(key, (this.currentClientSessionCollected.get(key) ?? 0) + count);
+  }
+
+  /**
+   * Returns a copy of what the current run has collected so far, by reward key.
+   */
+  public GetCurrentSessionCollected_Client(): Record<string, number> {
+    const collected: Record<string, number> = {};
+    this.currentClientSessionCollected.forEach((count, key) => {
+      collected[key] = count;
+    });
+    return collected;
+  }
+
+  // Absent rather than empty when nothing was collected, so the payload of a game that does not
+  // use this stays exactly as it was.
+  private getCollectedPayload(): { Collected?: Record<string, number> } {
+    return this.currentClientSessionCollected.size > 0
+      ? { Collected: this.GetCurrentSessionCollected_Client() }
+      : {};
   }
 
   /* ================= Dedicated Server Session Methods =================

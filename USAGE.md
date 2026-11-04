@@ -2617,6 +2617,48 @@ export class GameScene extends Phaser.Scene {
 
 ---
 
+### `RecordCollected_Client`
+
+Counts an item the player collected during the current run, such as a chest. The game only reports what was collected; what the player receives for it is set up on the platform.
+
+**Signature:**
+```typescript
+public RecordCollected_Client(key: string, count = 1): void
+```
+
+**Parameters:**
+- `key` - The reward key agreed for your game, for example `chest_1`. Other keys earn nothing.
+- `count` - How many to add. Default: `1`.
+
+**Usage:**
+```typescript
+export class GameScene extends Phaser.Scene {
+  onChestCollected() {
+    this.funtico.sdk.RecordCollected_Client('chest_1');
+  }
+}
+```
+
+**Important Notes:**
+- Synchronous and local. The counts leave the client with the result of `EndRoomSP` or `ResultTournament_Client`, including when the run was lost (`isSuccess: false`).
+- Each key has a limit per run. Agree it together with the key, so that a normal run cannot exceed it.
+- `CreateSession_Client`, `ReconnectToUnfinishedSession_Client`, and `CloseCurrentSession_Client` reset the counts. To keep them across a reconnect, store them in your session state and record them again with `count` after resuming.
+- A failed `EndRoomSP` or `ResultTournament_Client` keeps the counts, so a retry still sends them. `CompletePractice` and `CompleteCampaignLevel` do not send them: do not record anything in those modes.
+- An invalid call (empty key, or a count that is not a positive integer) logs an error and is ignored.
+
+---
+
+### `GetCurrentSessionCollected_Client`
+
+Returns a copy of what the current run has collected so far, by reward key. Useful for a counter on the HUD or the results screen, and for saving the counts in your session state.
+
+**Signature:**
+```typescript
+public GetCurrentSessionCollected_Client(): Record<string, number>
+```
+
+---
+
 ### `GetCurrentSessionEvents_Client`
 
 Returns everything recorded so far in the current session via `RecordEvent_Client`. Useful for debugging your event stream, or for inspecting or filtering the log before passing it explicitly to `EndRoomSP`.
