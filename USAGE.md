@@ -13,9 +13,10 @@ For installation and a quick-start integration walkthrough, see [README.md](./RE
 5. [Hall of Fame Methods](#hall-of-fame-methods)
 6. [Campaign Methods](#campaign-methods)
 7. [Inventory Methods](#inventory-methods)
-8. [Client Session Methods (Reconnection)](#client-session-methods-reconnection)
-9. [Phaser Plugin Integration](#phaser-plugin-integration)
-10. [Utilities & Types](#utilities--types)
+8. [Ghost Matchmaking Methods](#ghost-matchmaking-methods)
+9. [Client Session Methods (Reconnection)](#client-session-methods-reconnection)
+10. [Phaser Plugin Integration](#phaser-plugin-integration)
+11. [Utilities & Types](#utilities--types)
 
 ---
 
@@ -2443,6 +2444,247 @@ try {
   }
 }
 ```
+
+---
+
+## Ghost Matchmaking Methods
+
+Asynchronous PvP: the player fights a stored ship of another player — a **ghost** — or a bot. Nobody has to be online at the same time. Your game uploads the player's ship, asks for an opponent, plays the fight locally and reports the outcome.
+
+The server owns everything that affects other players: which opponent was issued, the run counters, the ratings, and that each fight is counted once. Every rule — which attributes match (level, round, ship size…), how far a search may widen, run limits, bots, rating — is configured per **pool** by your studio. Read the pools with `GetGhostPools` instead of hardcoding them.
+
+**Flow of a run:**
+1. `StartGhostRun(pool)` — in pools with runs (`HasRun`). An active run is resumed, not replaced.
+2. `FindGhostOpponent(pool, attributes, { snapshot })` — stores the player's current ship and returns a `GhostMatch`.
+3. Play the fight against `match.SnapshotJson`.
+4. `ReportGhostResult(match.MatchId, outcome)` — returns the new ratings and the run.
+5. Repeat 2–4 until `Run.Status` is no longer `Active` (the pool's `MaxWins`, `MaxLosses` or `MaxRounds` was reached).
+
+**Ships are your game's data.** `snapshot` is any JSON string your game can rebuild a ship from; the server stores and returns it unchanged. Keep it small (the pool sets a size limit) and include a version field of your own so old ships stay readable after an update.
+
+> **Casing note:** Ghost responses are **PascalCase** (`Match`, `MatchId`, `SnapshotJson`).
+
+**Failure model.** Ghost methods reject with a `GhostError` carrying a machine-readable `Code` — branch on the code, never on message text. `NoOpponent` is a normal outcome, not a failure: nobody matched and no bot was available.
+
+---
+
+### `GetGhostPools`
+
+Fetches the game's enabled ghost pools and the player's rating in each.
+
+**Signature:**
+```typescript
+public async GetGhostPools(): Promise<GhostPool[]>
+```
+
+**GhostPool Properties:**
+- `Key` (`string`) - The pool's key, passed to every other Ghost method.
+- `Name` (`string`) - Display name.
+- `Partition` (`string`) - The current season. Ships and ratings never mix across seasons.
+- `HasRun` (`boolean`) - `true` when the pool plays runs: start, fight until a limit, finish.
+- `MaxWins`, `MaxLosses`, `MaxRounds` (`number | null`) - The run limits.
+- `Attributes` (`GhostAttribute[]`) - What the pool matches on: `Name`, `Min`, `Max`, `Exact` (matched exactly on every search step) and `Bind` (`"Run.Round"`, `"Run.Wins"`, `"Run.Losses"` or `null`; bound attributes are filled from the run and may be omitted).
+- `Rating` (`number`) - The player's rating in the current season.
+
+---
+
+### `GetGhostRun` / `StartGhostRun` / `AbandonGhostRun`
+
+Read, start or give up the player's run in a pool with runs.
+
+**Signatures:**
+```typescript
+public async GetGhostRun(pool: string): Promise<GhostRunState>
+public async StartGhostRun(pool: string): Promise<GhostRunState>
+public async AbandonGhostRun(pool: string): Promise<GhostRunState>
+```
+
+**Returns:** `GhostRunState` with `Run: GhostRun | null` and `OpenMatch: GhostMatch | null`.
+
+- `GetGhostRun` returns the active run and its open match, so a reloaded game resumes the same fight. `Run` is `null` when the player has no active run. In a pool without runs both fields are always `null`: call `FindGhostOpponent` again to get the open match back.
+- `StartGhostRun` starts a run, or returns the active one. Rejects with `RunNotSupported` in a pool without runs.
+- `AbandonGhostRun` closes the active run. An open match is closed as not reported, which usually counts as a loss — abandoning cannot be used to dodge an opponent. Rejects with `RunNotActive` when there is nothing to abandon.
+
+**GhostRun Properties:** `RunId`, `Pool`, `Partition`, `Status` (`'Active' | 'Finished' | 'Abandoned'`), `Round` (= `Fights + 1`), `Fights`, `Wins`, `Losses`, `Draws`, `MaxWins`, `MaxLosses`, `MaxRounds`, `StartedAt`, `FinishedAt`.
+
+**Usage:**
+```typescript
+const state = await this.funtico.sdk.GetGhostRun('arena');
+if (state.OpenMatch) {
+  this.resumeFight(state.OpenMatch);
+} else if (!state.Run) {
+  const started = await this.funtico.sdk.StartGhostRun('arena');
+  this.showRun(started.Run!);
+}
+```
+
+---
+
+### `FindGhostOpponent`
+
+Finds an opponent for the player's next fight.
+
+**Signature:**
+```typescript
+public async FindGhostOpponent(pool: string, attributes: Record<string, number>, options: GhostFindOptions = {}): Promise<GhostFindResult>
+```
+
+**Parameters:**
+- `pool` - The pool's `Key`.
+- `attributes` - The values of the pool's attributes, by name. Bound attributes may be omitted; a bound value that differs from the server's run is refused with `RunStateMismatch`.
+- `options.snapshot` - The player's own ship, stored in the pool in the same request. Stored even when the search finds nobody.
+- `options.exclude` - Snapshot ids not to face (at most 20).
+- `options.allowBots` - `false` forbids bots for this search. Default: `true`.
+
+**Returns:** `GhostFindResult`:
+- `Match` (`GhostMatch`) - The opponent: `MatchId`, `SnapshotId`, `SnapshotJson` (the opponent's ship exactly as uploaded), `SnapshotSha256` (lowercase hex SHA-256 of its UTF-8 bytes), `IsBot`, `OwnerName`, `OwnerAvatarUrl`, `OwnerBorderUrl`, `OwnerRating`, `PlayerRating`, `OpponentAttributes`, `Step` (the search step that found it) and `ExpiresAt`.
+- `Run` (`GhostRun | null`) - The run, in pools with runs.
+- `UploadedSnapshotId` (`string | null`) - Id of the ship stored by this request.
+
+**Searching again before reporting returns the same match** (and stores no new ship), so an unwanted opponent cannot be rerolled. A match not reported by `ExpiresAt` is closed by the server and usually counts as a loss.
+
+**Usage:**
+```typescript
+import { GhostError, GhostErrorCode } from './sdk/FunticoPhaserSDK';
+
+try {
+  const found = await this.funtico.sdk.FindGhostOpponent('arena', { ShipSize: ship.size }, {
+    snapshot: JSON.stringify({ v: 1, modules: ship.modules })
+  });
+  this.startFight(JSON.parse(found.Match.SnapshotJson), found.Match);
+} catch (error) {
+  if (error instanceof GhostError && error.Code === GhostErrorCode.NoOpponent) {
+    this.startFightAgainstLocalGhost();
+  } else {
+    throw error;
+  }
+}
+```
+
+---
+
+### `UploadGhostSnapshot`
+
+Stores the player's ship in a pool without searching — for example right after the player edits it.
+
+**Signature:**
+```typescript
+public async UploadGhostSnapshot(pool: string, attributes: Record<string, number>, snapshot: string): Promise<GhostUploadResult>
+```
+
+**Returns:** `GhostUploadResult` with `SnapshotId`, `Sha256` and `Partition`.
+
+---
+
+### `ReportGhostResult`
+
+Reports the outcome of a match, once. The result is encrypted and signed with your game's private key.
+
+**Signature:**
+```typescript
+public async ReportGhostResult(matchId: string, outcome: GhostOutcome, fightHash: string | null = null): Promise<GhostReportResult>
+```
+
+**Parameters:**
+- `matchId` - `Match.MatchId` from `FindGhostOpponent`.
+- `outcome` - `GhostOutcome.Win`, `GhostOutcome.Loss` or `GhostOutcome.Draw`, from the player's point of view.
+- `fightHash` - Optional: your game's hash of the fight (up to 128 characters), kept with the match for a later replay check.
+
+**Returns:** `GhostReportResult` with `MatchId`, `Outcome`, `PlayerRatingBefore`, `PlayerRatingAfter`, `OpponentRatingBefore`, `OpponentRatingAfter` and `Run`.
+
+A repeated report of the same match returns the first result unchanged, so retrying after a network error is safe. Rejects with `MatchExpired` when the match was closed before the report arrived.
+
+**Usage:**
+```typescript
+import { GhostOutcome } from './sdk/FunticoPhaserSDK';
+
+const result = await this.funtico.sdk.ReportGhostResult(match.MatchId, won ? GhostOutcome.Win : GhostOutcome.Loss);
+this.showRatingChange(result.PlayerRatingBefore, result.PlayerRatingAfter);
+if (result.Run && result.Run.Status !== 'Active') {
+  this.showRunSummary(result.Run);
+}
+```
+
+---
+
+### `GetGhostReportSummary`
+
+What the player's ghosts did while the player was away. The call resets the `New…` counters, so show the result right away.
+
+**Signature:**
+```typescript
+public async GetGhostReportSummary(pool: string): Promise<GhostReportSummary>
+```
+
+**Returns:** `GhostReportSummary` with `Pool`, `Partition`, `Rating`, `NewGhostWins`, `NewGhostLosses`, `NewGhostDraws` (since the previous call) and `GhostWins`, `GhostLosses`, `GhostDraws` (season totals).
+
+**Usage:**
+```typescript
+const summary = await this.funtico.sdk.GetGhostReportSummary('arena');
+if (summary.NewGhostWins + summary.NewGhostLosses + summary.NewGhostDraws > 0) {
+  this.showToast(`Your ship won ${summary.NewGhostWins} and lost ${summary.NewGhostLosses} fights while you were away`);
+}
+```
+
+---
+
+### `GetGhostHistory`
+
+The player's fights and the fights against the player's ghosts in the current season, newest first.
+
+**Signature:**
+```typescript
+public async GetGhostHistory(pool: string, page = 1, limit = 20): Promise<GhostHistory>
+```
+
+**Returns:** `GhostHistory` with `Items`, `Page`, `Limit` and `HasMore`. Each `GhostHistoryItem` has `MatchId`, `Role` (`'Attacker'`: the player fought a ghost; `'Defender'`: someone fought the player's ghost), `Outcome` (from the player's point of view), `Expired`, `OpponentName`, `OpponentAvatarUrl`, `OpponentIsBot`, `RatingBefore`, `RatingAfter`, `Partition`, `CreatedAt` and `ClosedAt`.
+
+---
+
+### `GetGhostLeaderboard`
+
+Players of a pool's season ranked by rating, plus the player's own place. Only players who fought this season are ranked; a ship that was only uploaded does not count.
+
+**Signature:**
+```typescript
+public async GetGhostLeaderboard(pool: string, page = 1, limit = 20, partition: string | null = null): Promise<GhostLeaderboard>
+```
+
+**Parameters:**
+- `pool` - The pool's `Key`.
+- `page`, `limit` - Paging, `limit` up to 100.
+- `partition` - A past season (for example `"s1"`). Default: the current season.
+
+**Returns:** `GhostLeaderboard` with `Pool`, `Partition`, `Items`, `Me`, `Page`, `Limit` and `HasMore`. Each `GhostLeaderboardEntry` has `Place` (rating, then wins, high to low), `Name`, `AvatarUrl`, `Rating`, `Wins`, `Losses`, `Draws` (the player's own fights), `GhostWins`, `GhostLosses`, `GhostDraws` (fights against the player's ghosts) and `IsMe`. `Me` is the player's own row with its place even when it is not on the requested page, and `null` until the player has fought this season.
+
+**Usage:**
+```typescript
+const board = await this.funtico.sdk.GetGhostLeaderboard('arena');
+board.Items.forEach(entry => this.addRow(entry.Place, entry.Name, entry.Rating, entry.IsMe));
+if (board.Me && !board.Items.some(entry => entry.IsMe)) {
+  this.addOwnRow(board.Me.Place, board.Me.Rating);
+}
+```
+
+---
+
+### `GhostError`
+
+The error every Ghost method rejects with.
+
+**GhostErrorCode Values:**
+- `PoolNotFound` - No enabled pool with this key in this game.
+- `RunNotSupported` - The pool has no runs.
+- `RunNotActive` - The pool plays runs and the player has no active one (or it just ended). Start a run.
+- `RunStateMismatch` - A bound attribute differs from the server's run. Re-read the run with `GetGhostRun`.
+- `InvalidAttributes` - An attribute is unknown, missing or outside its `Min`..`Max`.
+- `InvalidSnapshot` - The ship is empty, not a JSON object, or too large.
+- `NoOpponent` - Nobody matched and no bot was available. Fight a local opponent or try again later.
+- `MatchNotFound` - No such match for this player.
+- `MatchExpired` - The match was closed before it was reported.
+- `InvalidSignature` - The report could not be verified. Check your game's private key.
+- `InvalidOutcome` - The outcome is not `Win`, `Loss` or `Draw`.
+- `Unknown` - The response carried no recognisable code.
 
 ---
 
