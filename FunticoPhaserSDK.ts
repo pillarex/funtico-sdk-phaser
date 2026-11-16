@@ -1012,11 +1012,11 @@ export interface RecentRewardItem {
 /** One reward a run, a campaign level or an arena run paid (or is paying) the player. */
 export interface RecentReward {
   Id: string;
-  /** 'Room', 'Tournament', 'Practice', 'Campaign' or 'Arena'. */
+  /** 'Room', 'Tournament', 'Practice', 'Campaign', 'Arena' or 'CommunityGoal'. */
   Source: string;
   /** The run it belongs to. */
   RunId: string;
-  /** The collected key or reward table that produced it. */
+  /** The collected key or reward table that produced it; for a Community Goal, the reward bracket. */
   Key: string;
   /** A RecentRewardStatus value. */
   Status: string;
@@ -1320,7 +1320,42 @@ export interface CommunityGoal {
   PayloadJson: string;
   /** When the goal is no longer open: the goal opened after it, if any. */
   NextGoalId: string | null;
+  /**
+   * The goal's reward brackets, top-down: at settlement each contributor gets the first bracket
+   * their final place matches, and only that one.
+   */
+  Rewards: CommunityGoalBracket[];
 }
+
+/** One reward bracket of a goal: who falls into it and what it pays, as configured for display. */
+export interface CommunityGoalBracket {
+  /** The bracket's key; CommunityGoalMe.Bracket names it. */
+  Name: string;
+  /** What to show for the bracket ("#1", "TOP 10%"). May be null. */
+  Label: string | null;
+  /** Exactly one of MaxPlace, MaxPercentile and AnyContribution is set: final places 1..MaxPlace. */
+  MaxPlace: number | null;
+  /** Final place x 100 / contributors at most this. */
+  MaxPercentile: number | null;
+  /** Every contributor not in an earlier bracket. */
+  AnyContribution: boolean;
+  /** What the bracket pays, as configured for display. The actual items are drawn at settlement. */
+  Display: CommunityGoalRewardDisplay[];
+}
+
+export interface CommunityGoalRewardDisplay {
+  Name: string;
+  ImageUrl: string | null;
+  Amount: number | null;
+}
+
+/**
+ * Where a contributor's bracket rewards are, once the goal is settled. 'None': no bracket (or
+ * nothing payable). 'Pending': placed, not drawn yet (usually within a minute). 'Queued': drawn, at
+ * least one still on its way. 'Delivered': everything drawn has arrived (a draw may come up empty).
+ * 'Failed': nothing left to send, but part of it was not accepted.
+ */
+export type CommunityGoalRewardStatus = 'None' | 'Pending' | 'Queued' | 'Delivered' | 'Failed';
 
 /** A started attempt. Pass it to CompleteGoalAttempt. */
 export interface GoalAttempt {
@@ -1344,6 +1379,8 @@ export interface CommunityGoalMe {
   Place: number | null;
   /** How much the player's contributions added to the goal. */
   Contributed: number;
+  /** The player's largest single accepted contribution to this goal ("best strike"). */
+  Best: number;
   Attempts: number;
   AttemptsUsedToday: number;
   /** Null when the chain has no daily limit. */
@@ -1354,6 +1391,13 @@ export interface CommunityGoalMe {
   /** Settled goals: the final place and the reward bracket it fell into. */
   FinalPlace: number | null;
   Bracket: string | null;
+  /** Settled goals: where the bracket rewards are. Null before settlement or for a non-contributor. */
+  RewardStatus: CommunityGoalRewardStatus | null;
+  /**
+   * What this goal paid the player, with item names and images. GetRecentRewards lists the same
+   * entries with Source 'CommunityGoal'.
+   */
+  Rewards: RecentReward[];
 }
 
 export interface CommunityGoalState {
@@ -1428,6 +1472,10 @@ export interface GoalAttemptResult {
   NextGoalId: string | null;
   Score: number;
   ScoreImproved: boolean;
+  /** The player's largest single accepted contribution to this goal, this one included. */
+  Best: number;
+  /** This contribution beat every earlier one of the player on this goal (the same on a replay). */
+  IsNewBest: boolean;
   Place: number | null;
   AttemptsLeftToday: number | null;
   ResetsAt: string;
@@ -1439,8 +1487,51 @@ export interface CommunityGoalLeaderboardEntry {
   AvatarUrl: string | null;
   Score: number;
   Contributed: number;
+  /** The player's largest single accepted contribution to this goal. */
+  Best: number;
   Attempts: number;
   IsMe: boolean;
+}
+
+/** A chain's past goals, newest first, as returned by GetCommunityGoalHistory. */
+export interface CommunityGoalHistory {
+  Items: CommunityGoalHistoryEntry[];
+  Total: number;
+  Page: number;
+  Limit: number;
+  HasMore: boolean;
+}
+
+export interface CommunityGoalHistoryEntry {
+  GoalId: string;
+  Number: number;
+  Name: string;
+  /** 'Closed' or 'Settled'. */
+  Status: CommunityGoalStatus;
+  TargetValue: number;
+  CurrentValue: number;
+  OpenedAt: string;
+  ClosedAt: string | null;
+  /** How long the goal held out, in seconds. */
+  LifetimeSeconds: number;
+  ContributorCount: number;
+  /** Your game's data for this goal, exactly as configured (a JSON string). */
+  PayloadJson: string;
+  /** The signed-in player's part in this goal; null when not signed in. */
+  Me: CommunityGoalHistoryMe | null;
+}
+
+export interface CommunityGoalHistoryMe {
+  IsContributor: boolean;
+  Score: number;
+  Contributed: number;
+  Best: number;
+  Attempts: number;
+  /** Contributed / the goal's CurrentValue, 0..1. */
+  Share: number;
+  FinalPlace: number | null;
+  Bracket: string | null;
+  RewardStatus: CommunityGoalRewardStatus | null;
 }
 
 export interface CommunityGoalLeaderboard {
@@ -3912,23 +4003,25 @@ export class FunticoSDK {
     if (!response.ok) await this.throwInventoryError(response, "Failed to fetch recent rewards");
 
     const wire: WireRecentRewardsResponse = await response.json();
+    return { Rewards: (wire.Rewards ?? []).map(reward => this.mapRecentReward(reward)) };
+  }
+
+  private mapRecentReward(reward: WireRecentReward): RecentReward {
     return {
-      Rewards: (wire.Rewards ?? []).map(reward => ({
-        Id: reward.Id,
-        Source: reward.Source ?? '',
-        RunId: reward.RunId ?? '',
-        Key: reward.Key ?? '',
-        Status: reward.Status ?? '',
-        Items: (reward.Items ?? []).map(item => ({
-          ItemId: item.ItemId,
-          GameItemId: item.GameItemId ?? null,
-          Name: item.Name ?? null,
-          ImageUrl: item.ImageUrl ?? null,
-          Amount: item.Amount ?? 1
-        })),
-        CreatedAt: reward.CreatedAt,
-        DeliveredAt: reward.DeliveredAt ?? null
-      }))
+      Id: reward.Id,
+      Source: reward.Source ?? '',
+      RunId: reward.RunId ?? '',
+      Key: reward.Key ?? '',
+      Status: reward.Status ?? '',
+      Items: (reward.Items ?? []).map(item => ({
+        ItemId: item.ItemId,
+        GameItemId: item.GameItemId ?? null,
+        Name: item.Name ?? null,
+        ImageUrl: item.ImageUrl ?? null,
+        Amount: item.Amount ?? 1
+      })),
+      CreatedAt: reward.CreatedAt,
+      DeliveredAt: reward.DeliveredAt ?? null
     };
   }
 
@@ -4249,7 +4342,10 @@ export class FunticoSDK {
     if (!response.ok) await this.throwCommunityGoalError(response, "Failed to complete the goal attempt");
 
     const wire: GoalAttemptResult = await response.json();
-    return { ...wire, MilestonesCrossed: wire.MilestonesCrossed ?? [], NextGoalId: wire.NextGoalId ?? null, Place: wire.Place ?? null };
+    return {
+      ...wire, MilestonesCrossed: wire.MilestonesCrossed ?? [], NextGoalId: wire.NextGoalId ?? null, Place: wire.Place ?? null,
+      Best: wire.Best ?? 0, IsNewBest: wire.IsNewBest ?? false
+    };
   }
 
   /** Contributors ranked by score (ties: who got there first), the player's own row and the rows around it. */
@@ -4261,7 +4357,33 @@ export class FunticoSDK {
     if (!response.ok) await this.throwCommunityGoalError(response, "Failed to fetch the goal leaderboard");
 
     const wire: CommunityGoalLeaderboard = await response.json();
-    return { ...wire, Items: wire.Items ?? [], Around: wire.Around ?? [], Me: wire.Me ?? null };
+    const entry = (row: CommunityGoalLeaderboardEntry): CommunityGoalLeaderboardEntry => ({ ...row, Best: row.Best ?? 0 });
+    return { ...wire, Items: (wire.Items ?? []).map(entry), Around: (wire.Around ?? []).map(entry), Me: wire.Me ? entry(wire.Me) : null };
+  }
+
+  /**
+   * The chain's past goals (closed or settled), newest first, with the signed-in player's part in
+   * each: score, best strike, share of the goal, final place, bracket and reward status. Up to 20
+   * per page. For one goal's full state and the rewards it paid, use GetCommunityGoalById.
+   */
+  public async GetCommunityGoalHistory(chainKey: string, page = 1, limit = 10): Promise<CommunityGoalHistory> {
+    const query = `page=${page}&limit=${limit}`;
+    const response = await fetch(`${this.apiUri}/CommunityGoal/${encodeURIComponent(chainKey)}/history?${query}`, {
+      headers: this.getOptionalAuthHeaders()
+    });
+    if (!response.ok) await this.throwCommunityGoalError(response, "Failed to fetch the goal history");
+
+    const wire: CommunityGoalHistory = await response.json();
+    return {
+      ...wire,
+      Items: (wire.Items ?? []).map(item => ({
+        ...item,
+        ClosedAt: item.ClosedAt ?? null,
+        Me: item.Me
+          ? { ...item.Me, FinalPlace: item.Me.FinalPlace ?? null, Bracket: item.Me.Bracket ?? null, RewardStatus: item.Me.RewardStatus ?? null }
+          : null
+      }))
+    };
   }
 
   /**
@@ -4335,11 +4457,16 @@ export class FunticoSDK {
 
   private mapCommunityGoalState(wire: CommunityGoalState): CommunityGoalState {
     const me = wire.Me ?? null;
+    const rewards = (me as { Rewards?: WireRecentReward[] | null } | null)?.Rewards ?? [];
     return {
       ...wire,
       Chain: { ...wire.Chain, Milestones: wire.Chain?.Milestones ?? [] },
       Goal: this.mapCommunityGoal(wire.Goal),
-      Me: me ? { ...me, OpenAttempt: this.mapGoalAttempt(me.OpenAttempt), Place: me.Place ?? null, FinalPlace: me.FinalPlace ?? null, Bracket: me.Bracket ?? null } : null
+      Me: me ? {
+        ...me, OpenAttempt: this.mapGoalAttempt(me.OpenAttempt), Place: me.Place ?? null, FinalPlace: me.FinalPlace ?? null,
+        Bracket: me.Bracket ?? null, Best: me.Best ?? 0, RewardStatus: me.RewardStatus ?? null,
+        Rewards: rewards.map(reward => this.mapRecentReward(reward))
+      } : null
     };
   }
 
@@ -4350,7 +4477,17 @@ export class FunticoSDK {
 
   private mapCommunityGoal(wire: CommunityGoal | null | undefined): CommunityGoal | null {
     if (!wire) return null;
-    return { ...wire, MilestonesPassed: wire.MilestonesPassed ?? [], ClosedAt: wire.ClosedAt ?? null, NextGoalId: wire.NextGoalId ?? null };
+    return {
+      ...wire, MilestonesPassed: wire.MilestonesPassed ?? [], ClosedAt: wire.ClosedAt ?? null, NextGoalId: wire.NextGoalId ?? null,
+      Rewards: (wire.Rewards ?? []).map(bracket => ({
+        ...bracket,
+        Label: bracket.Label ?? null,
+        MaxPlace: bracket.MaxPlace ?? null,
+        MaxPercentile: bracket.MaxPercentile ?? null,
+        AnyContribution: bracket.AnyContribution ?? false,
+        Display: (bracket.Display ?? []).map(shown => ({ ...shown, ImageUrl: shown.ImageUrl ?? null, Amount: shown.Amount ?? null }))
+      }))
+    };
   }
 
   private async throwCommunityGoalError(response: Response, fallback: string): Promise<never> {
