@@ -1243,6 +1243,233 @@ export interface GhostLeaderboard {
   HasMore: boolean;
 }
 
+/**
+ * Machine-readable reasons a Community Goal method can fail. Branch on these, never on message text.
+ * `GoalClosed` carries NextGoalId (load that goal: it has its own data); `NoAttemptsLeft` carries ResetsAt.
+ */
+export enum CommunityGoalErrorCode {
+  ChainNotFound = 'ChainNotFound',
+  GoalNotFound = 'GoalNotFound',
+  GoalClosed = 'GoalClosed',
+  NoAttemptsLeft = 'NoAttemptsLeft',
+  AttemptNotFound = 'AttemptNotFound',
+  AttemptExpired = 'AttemptExpired',
+  CompletionTooFast = 'CompletionTooFast',
+  InvalidSignature = 'InvalidSignature',
+  InvalidContribution = 'InvalidContribution',
+  /** The response carried no recognisable code. */
+  Unknown = 'Unknown'
+}
+
+/** Error thrown by the Community Goal methods. `instanceof CommunityGoalError` is reliable. */
+export class CommunityGoalError extends Error {
+  public readonly Code: CommunityGoalErrorCode;
+  /** GoalClosed: the goal open in the chain now, if any. */
+  public readonly NextGoalId: string | null;
+  /** NoAttemptsLeft: when the daily attempts reset (UTC midnight, ISO string). */
+  public readonly ResetsAt: string | null;
+
+  constructor(code: CommunityGoalErrorCode, message: string, nextGoalId: string | null = null, resetsAt: string | null = null) {
+    super(message);
+    Object.setPrototypeOf(this, CommunityGoalError.prototype);
+    this.name = 'CommunityGoalError';
+    this.Code = code;
+    this.NextGoalId = nextGoalId;
+    this.ResetsAt = resetsAt;
+  }
+}
+
+/** "Open": accepting attempts. "Closed": target reached, late attempts may still land. "Settled": final places fixed. */
+export type CommunityGoalStatus = 'Open' | 'Closed' | 'Settled';
+
+/** How a player's contributions form their place: all summed, the single best, or the best of each UTC day summed. */
+export type CommunityGoalScoring = 'Sum' | 'Best' | 'BestPerDay';
+
+/** A chain of goals and its rules, as far as the game needs them. */
+export interface CommunityGoalChain {
+  Key: string;
+  Name: string;
+  Scoring: CommunityGoalScoring;
+  /** Free attempts per player per UTC day across the whole chain; 0 means no limit. */
+  FreeAttemptsPerDay: number;
+  /** Shortest accepted attempt (server clock). */
+  MinAttemptSeconds: number;
+  /** An attempt not completed within this time expires with no contribution. */
+  AttemptTtlSeconds: number;
+  /** Progress fractions (0 < f < 1) worth reacting to, ascending. */
+  Milestones: number[];
+}
+
+/** One goal of a chain and its shared state. */
+export interface CommunityGoal {
+  GoalId: string;
+  /** 1, 2, 3... within the chain. */
+  Number: number;
+  Name: string;
+  Status: CommunityGoalStatus;
+  TargetValue: number;
+  /** Sum of every accepted contribution; may pass TargetValue. */
+  CurrentValue: number;
+  /** CurrentValue / TargetValue, at most 1. */
+  Progress: number;
+  MilestonesPassed: number[];
+  OpenedAt: string;
+  ClosedAt: string | null;
+  ContributorCount: number;
+  /** Your game's data for this goal, exactly as configured (a JSON string). */
+  PayloadJson: string;
+  /** When the goal is no longer open: the goal opened after it, if any. */
+  NextGoalId: string | null;
+}
+
+/** A started attempt. Pass it to CompleteGoalAttempt. */
+export interface GoalAttempt {
+  AttemptId: string;
+  GoalId: string;
+  /** Server-chosen random number; the same every time the attempt is resumed. */
+  Seed: number;
+  StartedAt: string;
+  ExpiresAt: string;
+  /** The goal's value when the attempt started; the same every time the attempt is resumed. */
+  GoalValueAtStart: number;
+  /** Milestones the goal had passed when the attempt started: the phase to play the attempt in. */
+  MilestonesAtStart: number[];
+}
+
+/** The signed-in player's own state in a chain and on a goal. */
+export interface CommunityGoalMe {
+  IsContributor: boolean;
+  Score: number;
+  /** Null when not a contributor. */
+  Place: number | null;
+  /** How much the player's contributions added to the goal. */
+  Contributed: number;
+  Attempts: number;
+  AttemptsUsedToday: number;
+  /** Null when the chain has no daily limit. */
+  AttemptsLeftToday: number | null;
+  ResetsAt: string;
+  /** The player's live attempt (possibly on another goal): finish it before starting a new one. */
+  OpenAttempt: GoalAttempt | null;
+  /** Settled goals: the final place and the reward bracket it fell into. */
+  FinalPlace: number | null;
+  Bracket: string | null;
+}
+
+export interface CommunityGoalState {
+  Chain: CommunityGoalChain;
+  /** The open goal (or the requested one); null when the chain has never had a goal. */
+  Goal: CommunityGoal | null;
+  /** No goal is open right now: the last one closed and the next is not open yet. */
+  AwaitingNext: boolean;
+  /** Null when no player is signed in. */
+  Me: CommunityGoalMe | null;
+  /** Poll the live state no more often than this. */
+  PollAfterSeconds: number;
+  ServerTime: string;
+}
+
+/** The shared state only: what to poll. */
+export interface CommunityGoalLive {
+  GoalId: string;
+  Number: number;
+  Status: CommunityGoalStatus;
+  TargetValue: number;
+  CurrentValue: number;
+  Progress: number;
+  MilestonesPassed: number[];
+  ContributorCount: number;
+  NextGoalId: string | null;
+  PollAfterSeconds: number;
+  ServerTime: string;
+}
+
+export interface GoalAttemptStart {
+  Attempt: GoalAttempt;
+  /** True when this is the player's already-live attempt returned again (no attempt spent). */
+  Resumed: boolean;
+  /**
+   * The goal the attempt belongs to: its payload and current state. Play in the phase of
+   * Attempt.MilestonesAtStart - on a resumed attempt the goal may have moved on since the start.
+   */
+  Goal: CommunityGoal;
+  AttemptsLeftToday: number | null;
+  ResetsAt: string;
+}
+
+export interface CompleteGoalAttemptOptions {
+  /** Your own measure of the attempt; informative only. */
+  clientDurationSeconds?: number;
+  /** Up to 16 numbers for analytics. */
+  metrics?: Record<string, number>;
+  /** A hash of the attempt, up to 128 characters. */
+  fightHash?: string;
+}
+
+export interface GoalAttemptResult {
+  AttemptId: string;
+  GoalId: string;
+  /** True when this answers a repeat of an already completed attempt. */
+  Replayed: boolean;
+  Reported: number;
+  /** What counted: Reported cut down to the chain's plausibility limits. */
+  Accepted: number;
+  Capped: boolean;
+  ValueBefore: number;
+  ValueAfter: number;
+  TargetValue: number;
+  /** Milestones this contribution carried the goal past. */
+  MilestonesCrossed: number[];
+  GoalStatus: CommunityGoalStatus;
+  /** The goal is closed now (by this contribution or before it). */
+  GoalClosed: boolean;
+  /** This contribution reached the target. */
+  ClosedByMe: boolean;
+  NextGoalId: string | null;
+  Score: number;
+  ScoreImproved: boolean;
+  Place: number | null;
+  AttemptsLeftToday: number | null;
+  ResetsAt: string;
+}
+
+export interface CommunityGoalLeaderboardEntry {
+  Place: number;
+  Name: string | null;
+  AvatarUrl: string | null;
+  Score: number;
+  Contributed: number;
+  Attempts: number;
+  IsMe: boolean;
+}
+
+export interface CommunityGoalLeaderboard {
+  GoalId: string;
+  Items: CommunityGoalLeaderboardEntry[];
+  /** The player's own row, wherever it is; null until they contribute (or when not signed in). */
+  Me: CommunityGoalLeaderboardEntry | null;
+  /** Up to two rows above and below the player, the player included. */
+  Around: CommunityGoalLeaderboardEntry[];
+  Total: number;
+  Page: number;
+  Limit: number;
+  HasMore: boolean;
+}
+
+export interface WatchCommunityGoalOptions {
+  /** Called when a poll fails; polling goes on. */
+  onError?: (error: unknown) => void;
+  /** Never poll more often than this, whatever the server asks. Default 2. */
+  minIntervalSeconds?: number;
+  /** Keep polling while the page is hidden. Default false (polling pauses in the background). */
+  pollWhenHidden?: boolean;
+}
+
+/** Handle of a running WatchCommunityGoal. */
+export interface CommunityGoalWatch {
+  stop(): void;
+}
+
 /* ============================================================================================
  * WIRE-LEVEL PLUMBING - INTERNAL. NOT PART OF THE PUBLIC API.
  *
@@ -1686,6 +1913,14 @@ interface WireInventoryErrorBody {
 interface WireGhostErrorBody {
   Error: string;
   Message: string;
+}
+
+/** Non-2xx body of the Community Goal endpoints: `Error` is a CommunityGoalErrorCode identifier. */
+interface WireCommunityGoalErrorBody {
+  Error: string;
+  Message: string;
+  NextGoalId?: string | null;
+  ResetsAt?: string | null;
 }
 
 /**
@@ -3916,6 +4151,231 @@ export class FunticoSDK {
     }
 
     throw new GhostError(code, `${fallback}: ${message}`);
+  }
+
+  /* ================= Community Goal Methods =================
+   *
+   * Every player of the game pushes one shared counter toward a target ("defeat the world boss",
+   * "collect a million coins"). Goals of a chain open one after another. A player starts an attempt
+   * (one of the day's attempts), plays, and completes it with a contribution: a whole number of
+   * whatever the game counts. What a contribution means, and the goal's own data (PayloadJson), are
+   * entirely the game's. Reads work before sign-in; attempts need a signed-in player.
+   */
+
+  /** The chain's open goal (or its latest while the next one is not open yet) and the player's own state. */
+  public async GetCommunityGoal(chainKey: string): Promise<CommunityGoalState> {
+    const response = await fetch(`${this.apiUri}/CommunityGoal/${encodeURIComponent(chainKey)}`, {
+      headers: this.getOptionalAuthHeaders()
+    });
+    if (!response.ok) await this.throwCommunityGoalError(response, "Failed to fetch the community goal");
+    return this.mapCommunityGoalState(await response.json());
+  }
+
+  /** Any goal of the game by id, open or past (e.g. the one NextGoalId names). */
+  public async GetCommunityGoalById(goalId: string): Promise<CommunityGoalState> {
+    const response = await fetch(`${this.apiUri}/CommunityGoal/goal/${encodeURIComponent(goalId)}`, {
+      headers: this.getOptionalAuthHeaders()
+    });
+    if (!response.ok) await this.throwCommunityGoalError(response, "Failed to fetch the community goal");
+    return this.mapCommunityGoalState(await response.json());
+  }
+
+  /** The shared state only. Cheap; poll it no more often than PollAfterSeconds (or use WatchCommunityGoal). */
+  public async GetCommunityGoalLive(goalId: string): Promise<CommunityGoalLive> {
+    const response = await fetch(`${this.apiUri}/CommunityGoal/goal/${encodeURIComponent(goalId)}/live`, {
+      headers: this.getOptionalAuthHeaders()
+    });
+    if (!response.ok) await this.throwCommunityGoalError(response, "Failed to fetch the live goal state");
+
+    const wire: CommunityGoalLive = await response.json();
+    return { ...wire, MilestonesPassed: wire.MilestonesPassed ?? [], NextGoalId: wire.NextGoalId ?? null };
+  }
+
+  /**
+   * Starts an attempt on an open goal, spending one of today's attempts. If the player already has
+   * a live attempt in the chain, that one is returned again (Resumed = true, nothing spent) - also
+   * when it belongs to another goal, so always play against the returned Goal.
+   *
+   * Rejects with CommunityGoalError: `GoalClosed` (load NextGoalId), `NoAttemptsLeft` (see ResetsAt).
+   */
+  public async StartGoalAttempt(goalId: string): Promise<GoalAttemptStart> {
+    const response = await fetch(`${this.apiUri}/CommunityGoal/attempt/start?goalId=${encodeURIComponent(goalId)}`, {
+      method: "POST",
+      headers: this.getAuthHeaders(false)
+    });
+    if (!response.ok) await this.throwCommunityGoalError(response, "Failed to start a goal attempt");
+
+    const wire: GoalAttemptStart = await response.json();
+    return { ...wire, Attempt: this.mapGoalAttempt(wire.Attempt)!, Goal: this.mapCommunityGoal(wire.Goal)! };
+  }
+
+  /**
+   * Completes an attempt with its contribution, once: a repeat returns the first result
+   * (Replayed = true). The result is encrypted and signed like a campaign completion. An attempt
+   * started before its goal closed still counts in full.
+   *
+   * Rejects with CommunityGoalError: `AttemptExpired`, `CompletionTooFast` (the attempt is used),
+   * `InvalidContribution`.
+   */
+  public async CompleteGoalAttempt(attempt: Pick<GoalAttempt, 'AttemptId' | 'GoalId'>, contribution: number,
+    options: CompleteGoalAttemptOptions = {}): Promise<GoalAttemptResult> {
+    const headers = this.getAuthHeaders();
+    if (!attempt || !attempt.AttemptId || !attempt.GoalId) {
+      throw new CommunityGoalError(CommunityGoalErrorCode.AttemptNotFound, "Pass the attempt returned by StartGoalAttempt.");
+    }
+    if (!Number.isSafeInteger(contribution) || contribution < 0) {
+      throw new CommunityGoalError(CommunityGoalErrorCode.InvalidContribution,
+        `Contribution must be a whole number of 0 or more, got ${contribution}.`);
+    }
+
+    const id = String(attempt.AttemptId).toLowerCase();
+    const plainText = JSON.stringify({
+      AttemptId: id,
+      GoalId: String(attempt.GoalId).toLowerCase(),
+      Contribution: contribution,
+      ClientDurationSeconds: options.clientDurationSeconds ?? null,
+      Metrics: options.metrics ?? null,
+      FightHash: options.fightHash ?? null
+    });
+    const encryptionKey = id.substring(0, 8) + this.config.privateGameKey.substring(0, 8);
+    const encryptedData = await CryptoHelper.encrypt(plainText, encryptionKey);
+    const hash = await CryptoHelper.hmacSha256(encryptedData, this.config.privateGameKey.substring(8));
+
+    const response = await fetch(`${this.apiUri}/CommunityGoal/attempt/complete`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ AttemptId: id, EncryptedData: encryptedData, Hash: hash })
+    });
+    if (!response.ok) await this.throwCommunityGoalError(response, "Failed to complete the goal attempt");
+
+    const wire: GoalAttemptResult = await response.json();
+    return { ...wire, MilestonesCrossed: wire.MilestonesCrossed ?? [], NextGoalId: wire.NextGoalId ?? null, Place: wire.Place ?? null };
+  }
+
+  /** Contributors ranked by score (ties: who got there first), the player's own row and the rows around it. */
+  public async GetCommunityGoalLeaderboard(goalId: string, page = 1, limit = 20): Promise<CommunityGoalLeaderboard> {
+    const query = `page=${page}&limit=${limit}`;
+    const response = await fetch(`${this.apiUri}/CommunityGoal/goal/${encodeURIComponent(goalId)}/leaderboard?${query}`, {
+      headers: this.getOptionalAuthHeaders()
+    });
+    if (!response.ok) await this.throwCommunityGoalError(response, "Failed to fetch the goal leaderboard");
+
+    const wire: CommunityGoalLeaderboard = await response.json();
+    return { ...wire, Items: wire.Items ?? [], Around: wire.Around ?? [], Me: wire.Me ?? null };
+  }
+
+  /**
+   * Polls a goal's live state at the interval the server asks for and calls onChange whenever the
+   * value, status or contributor count changes (and once at the start). Pauses while the page is
+   * hidden, and stops by itself once the goal is settled (it never changes again). Call stop() when
+   * the goal leaves the screen.
+   */
+  public WatchCommunityGoal(goalId: string, onChange: (live: CommunityGoalLive) => void,
+    options: WatchCommunityGoalOptions = {}): CommunityGoalWatch {
+    const minInterval = Math.max(1, options.minIntervalSeconds ?? 2);
+    const hasDocument = typeof document !== 'undefined' && typeof document.addEventListener === 'function';
+    let stopped = false;
+    let running = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let interval = 5;
+    let last: string | null = null;
+
+    const isHidden = () => !options.pollWhenHidden && hasDocument && document.hidden === true;
+
+    const stop = () => {
+      stopped = true;
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+      if (hasDocument) document.removeEventListener('visibilitychange', onVisibility);
+    };
+
+    const tick = async () => {
+      timer = null;
+      if (stopped || running) return;
+      if (isHidden()) return; // resumed by the visibilitychange listener
+      running = true;
+      try {
+        const live = await this.GetCommunityGoalLive(goalId);
+        if (stopped) return;
+        if (live.PollAfterSeconds > 0) interval = live.PollAfterSeconds;
+        const key = `${live.Status}|${live.CurrentValue}|${live.ContributorCount}|${live.NextGoalId}`;
+        if (key !== last) {
+          last = key;
+          onChange(live);
+        }
+        if (live.Status === 'Settled') {
+          stop();
+          return;
+        }
+      } catch (error) {
+        if (!stopped) options.onError?.(error);
+      } finally {
+        running = false;
+      }
+      if (!stopped) timer = setTimeout(() => void tick(), Math.max(minInterval, interval) * 1000);
+    };
+
+    function onVisibility() {
+      if (!stopped && !isHidden() && timer === null && !running) void tick();
+    }
+
+    if (hasDocument) document.addEventListener('visibilitychange', onVisibility);
+    void tick();
+    return { stop };
+  }
+
+  /** X-User-Key always; the player's token only when signed in (Community Goal reads work before sign-in). */
+  private getOptionalAuthHeaders(): Record<string, string> {
+    const headers: Record<string, string> = { "X-User-Key": this.config.publicGameKey };
+    if (this.jwtToken) {
+      headers["Authorization"] = `Bearer ${this.jwtToken}`;
+    }
+    return headers;
+  }
+
+  private mapCommunityGoalState(wire: CommunityGoalState): CommunityGoalState {
+    const me = wire.Me ?? null;
+    return {
+      ...wire,
+      Chain: { ...wire.Chain, Milestones: wire.Chain?.Milestones ?? [] },
+      Goal: this.mapCommunityGoal(wire.Goal),
+      Me: me ? { ...me, OpenAttempt: this.mapGoalAttempt(me.OpenAttempt), Place: me.Place ?? null, FinalPlace: me.FinalPlace ?? null, Bracket: me.Bracket ?? null } : null
+    };
+  }
+
+  private mapGoalAttempt(wire: GoalAttempt | null | undefined): GoalAttempt | null {
+    if (!wire) return null;
+    return { ...wire, MilestonesAtStart: wire.MilestonesAtStart ?? [] };
+  }
+
+  private mapCommunityGoal(wire: CommunityGoal | null | undefined): CommunityGoal | null {
+    if (!wire) return null;
+    return { ...wire, MilestonesPassed: wire.MilestonesPassed ?? [], ClosedAt: wire.ClosedAt ?? null, NextGoalId: wire.NextGoalId ?? null };
+  }
+
+  private async throwCommunityGoalError(response: Response, fallback: string): Promise<never> {
+    const text = await response.text();
+    let code = CommunityGoalErrorCode.Unknown;
+    let message = text || `HTTP ${response.status}`;
+    let nextGoalId: string | null = null;
+    let resetsAt: string | null = null;
+
+    try {
+      const parsed: WireCommunityGoalErrorBody | null = JSON.parse(text);
+      if (parsed && typeof parsed.Error === 'string' &&
+        (Object.values(CommunityGoalErrorCode) as string[]).includes(parsed.Error)) {
+        code = parsed.Error as CommunityGoalErrorCode;
+      }
+      if (parsed && typeof parsed.Message === 'string') {
+        message = parsed.Message;
+      }
+      nextGoalId = parsed?.NextGoalId ?? null;
+      resetsAt = parsed?.ResetsAt ?? null;
+    } catch {
+      // Not a JSON body - keep the raw text under the Unknown code.
+    }
+
+    throw new CommunityGoalError(code, `${fallback}: ${message}`, nextGoalId, resetsAt);
   }
 
   /* ================= Dedicated Server Session Methods =================
