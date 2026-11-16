@@ -984,6 +984,55 @@ export interface InventoryResponse {
   Items: InventoryItem[];
 }
 
+/** Values of RecentReward.Status. */
+export enum RecentRewardStatus {
+  /** Accepted and on its way to the player's inventory. */
+  Queued = 'Queued',
+  /** In the player's inventory. */
+  Delivered = 'Delivered',
+  /** A random draw that paid nothing. */
+  Empty = 'Empty',
+  /** The platform refused it. */
+  Refused = 'Refused',
+  /** Gave up after repeated failures. */
+  Failed = 'Failed',
+}
+
+/** One item a reward pays. */
+export interface RecentRewardItem {
+  /** Funtico catalog id of the item. */
+  ItemId: number;
+  /** Your game's own key for the item. May be null. */
+  GameItemId: string | null;
+  Name: string | null;
+  ImageUrl: string | null;
+  Amount: number;
+}
+
+/** One reward a run, a campaign level or an arena run paid (or is paying) the player. */
+export interface RecentReward {
+  Id: string;
+  /** 'Room', 'Tournament', 'Practice', 'Campaign' or 'Arena'. */
+  Source: string;
+  /** The run it belongs to. */
+  RunId: string;
+  /** The collected key or reward table that produced it. */
+  Key: string;
+  /** A RecentRewardStatus value. */
+  Status: string;
+  /** What it pays. Empty for an Empty draw and for some rewards not delivered yet. */
+  Items: RecentRewardItem[];
+  /** ISO-8601, UTC. */
+  CreatedAt: string;
+  /** ISO-8601, UTC; null until delivered. */
+  DeliveredAt: string | null;
+}
+
+/** The player's latest rewards in this game, newest first, as returned by GetRecentRewards. */
+export interface RecentRewardsResponse {
+  Rewards: RecentReward[];
+}
+
 /**
  * Machine-readable reasons a Ghost method can fail. Branch on these, never on message text.
  * `NoOpponent` is a normal outcome: nobody matched and no bot was available - fall back to a
@@ -1599,6 +1648,32 @@ interface WireInventoryItem {
 /** GET /Inventory -> 200 body. */
 interface WireInventoryResponse {
   Items: WireInventoryItem[] | null;
+}
+
+/** GET /Rewards/recent -> one item of a reward. */
+interface WireRecentRewardItem {
+  ItemId: number;
+  GameItemId: string | null;
+  Name: string | null;
+  ImageUrl: string | null;
+  Amount: number;
+}
+
+/** GET /Rewards/recent -> one entry of `Rewards`. */
+interface WireRecentReward {
+  Id: string;
+  Source: string | null;
+  RunId: string | null;
+  Key: string | null;
+  Status: string | null;
+  Items: WireRecentRewardItem[] | null;
+  CreatedAt: string;
+  DeliveredAt: string | null;
+}
+
+/** GET /Rewards/recent -> 200 body. */
+interface WireRecentRewardsResponse {
+  Rewards: WireRecentReward[] | null;
 }
 
 /** Non-2xx body of the Inventory endpoint: `Error` is an InventoryErrorCode identifier. */
@@ -3580,6 +3655,46 @@ export class FunticoSDK {
     } catch {
       throw new Error(`Inventory item "${item.Name}" carries properties that are not valid JSON.`);
     }
+  }
+
+  /**
+   * The player's latest rewards in this game, newest first: what runs (RecordCollected_Client),
+   * campaign levels and arena runs paid. Call it after a result to show what the run brought.
+   *
+   * @param limit 1-100, default 20.
+   * @param since Only rewards created at or after this moment, for example when the run started.
+   *
+   * Always calls the server. Rejects with an InventoryError. A reward that could not reach the
+   * platform yet is listed as Queued and delivered later, at the latest on the player's next login.
+   */
+  public async GetRecentRewards(limit = 20, since: Date | null = null): Promise<RecentRewardsResponse> {
+    const params = new URLSearchParams({ limit: String(Math.min(Math.max(Math.trunc(limit) || 20, 1), 100)) });
+    if (since) params.set('since', since.toISOString());
+
+    const response = await fetch(`${this.apiUri}/Rewards/recent?${params.toString()}`, {
+      headers: this.getAuthHeaders(false)
+    });
+    if (!response.ok) await this.throwInventoryError(response, "Failed to fetch recent rewards");
+
+    const wire: WireRecentRewardsResponse = await response.json();
+    return {
+      Rewards: (wire.Rewards ?? []).map(reward => ({
+        Id: reward.Id,
+        Source: reward.Source ?? '',
+        RunId: reward.RunId ?? '',
+        Key: reward.Key ?? '',
+        Status: reward.Status ?? '',
+        Items: (reward.Items ?? []).map(item => ({
+          ItemId: item.ItemId,
+          GameItemId: item.GameItemId ?? null,
+          Name: item.Name ?? null,
+          ImageUrl: item.ImageUrl ?? null,
+          Amount: item.Amount ?? 1
+        })),
+        CreatedAt: reward.CreatedAt,
+        DeliveredAt: reward.DeliveredAt ?? null
+      }))
+    };
   }
 
   private mapInventoryItem(wire: WireInventoryItem): InventoryItem {
