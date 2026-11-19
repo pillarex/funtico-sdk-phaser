@@ -2,7 +2,7 @@
 
 This guide describes the setup and usage of the Funtico Games SDK for games running on the **Phaser 3** engine (including web games and Telegram Mini Apps).
 
-The SDK covers rooms and tournament management, special tournaments, the Hall of Fame leaderboard, Campaign Mode, and client-side session reconnection.
+The SDK covers rooms and tournament management, special tournaments, practice results, the Hall of Fame leaderboard, Campaign Mode, and client-side session reconnection.
 
 ## 📖 Documentation
 
@@ -299,6 +299,26 @@ distribution.items.forEach(item => {
 ```
 
 > **Note:** Distribution prizes use the shared **`Prize`** union — the same one `GetPrizePoolDistribution` returns. Narrow on the lowercase `type`. The value fields are PascalCase (`Value`, `Amount`, `ItemId`, `PrizeId`, `Currency`) and the nested `Item` is lowercase (`id`/`image`/`name`). Item artwork is at `prize.Item.image`; load it with Phaser's own loader.
+
+### Submitting a Practice Result
+
+Practice runs need no room and no entry fee. Submit the score when the run ends; it is ranked under `HallOfFameGameModeFilter.Practice`.
+
+```typescript
+// Optional during the run: both are sent with the result
+this.funtico.sdk.RecordEvent_Client(JSON.stringify({ type: 'wave_cleared', wave: 3 }));
+this.funtico.sdk.RecordCollected_Client('chest_1');
+
+try {
+  // The SDK encrypts and signs the payload for you
+  await this.funtico.sdk.CompletePractice(this.score);
+} catch (err) {
+  // The run, its events and its counts are kept: calling CompletePractice again resends the same run
+  console.error('Failed to save the practice result:', err);
+}
+```
+
+> **Note:** A delivered result clears the recorded events and counts. Pass `{ collected, gameEvents }` as the second argument to send your own instead. See [USAGE.md](./USAGE.md#completepractice) for the details.
 
 ---
 

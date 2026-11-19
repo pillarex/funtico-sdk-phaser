@@ -690,6 +690,17 @@ export interface ServerUserData {
 }
 
 /**
+ * Optional overrides for CompletePractice. Each field you leave out is taken from what the run
+ * recorded in the SDK.
+ */
+export interface CompletePracticeOptions {
+  /** Send these counts instead of what RecordCollected_Client recorded. */
+  collected?: Record<string, number>;
+  /** Send these events instead of what RecordEvent_Client recorded. */
+  gameEvents?: string[];
+}
+
+/**
  * Hall of Fame leaderboard entry.
  *
  * Fields are camelCase, unlike the rest of this SDK: that is how the /HallOfFame endpoints send them.
@@ -1050,6 +1061,8 @@ export enum GhostErrorCode {
   MatchExpired = 'MatchExpired',
   InvalidSignature = 'InvalidSignature',
   InvalidOutcome = 'InvalidOutcome',
+  /** The report's matchData is over 32 KB in UTF-8. Nothing was recorded and the match stays open: report again without it. */
+  DataTooLarge = 'DataTooLarge',
   /** The response carried no recognisable code. */
   Unknown = 'Unknown'
 }
@@ -2216,6 +2229,10 @@ export class FunticoSDK {
   private currentClientSessionEvents: string[] = [];
   private currentClientSessionCollected: Map<string, number> = new Map();
 
+  // Id of the practice run CompletePractice is submitting; kept across a failed submit, so a retry
+  // is the same run.
+  private practiceRunId: string | null = null;
+
   // Campaign attempt tracking (client-side only; set by StartCampaignLevel)
   private activeCampaignAttempt: CampaignAttemptData | null = null;
 
@@ -2674,7 +2691,7 @@ export class FunticoSDK {
   }
 
   /**
-   * Fresh idempotency key per join attempt.
+   * Fresh random v4 UUID: the idempotency key of a join attempt, the id of a practice run.
    *
    * crypto.randomUUID() is only exposed in secure contexts, so it is absent (or throws) on plain
    * HTTP - which games served over http:// do hit. Fall back to getRandomValues, and only then to
@@ -3357,6 +3374,78 @@ export class FunticoSDK {
     return await response.json(); // returns boolean success
   }
 
+  /* ================= Practice Methods ================= */
+
+  /**
+   * Submits the result of a practice run, encrypted and signed with privateGameKey. Call it once,
+   * when the run is over. The result is ranked in the Hall of Fame as a Practice result.
+   *
+   * What the run recorded goes with the result: the counts from RecordCollected_Client (keys your
+   * game has opened for practice can pay rewards) and the events from RecordEvent_Client. Pass
+   * options.collected or options.gameEvents to send your own instead. Empty counts and an empty
+   * event list are left out of the payload.
+   *
+   * Each practice run carries an id the SDK makes for it. A failed submit (a rejection or a network
+   * error) keeps that id, the recorded counts and the events, so calling again resends the same run
+   * and its rewards are not paid twice. A delivered result clears the recorded counts and events
+   * (also when you passed your own) and the next run gets a new id.
+   *
+   * Needs the player's UserId: the cached user data is used, and loaded first when none is cached.
+   *
+   * @param score The run's score. Fractional values are truncated toward zero, and the result must
+   *              fit a 32-bit integer; otherwise this throws before anything is sent.
+   * @returns true once the result is recorded. Rejects with an Error when the server refuses it.
+   */
+  public async CompletePractice(score: number, options: CompletePracticeOptions = {}): Promise<boolean> {
+    const headers = this.getAuthHeaders(true);
+    if (typeof score !== 'number' || !Number.isFinite(score) ||
+      Math.trunc(score) < -2147483648 || Math.trunc(score) > 2147483647) {
+      throw new Error(`CompletePractice: score must be a finite number that fits a 32-bit integer, got ${score}.`);
+    }
+    const wholeScore = Math.trunc(score);
+
+    const user = this.cachedUserData ?? await this.GetUserData(false);
+
+    if (this.practiceRunId === null) {
+      this.practiceRunId = this.newIdempotencyKey();
+    }
+    const runId = this.practiceRunId;
+
+    const collected = options?.collected ?? this.GetCurrentSessionCollected_Client();
+    const gameEvents = options?.gameEvents ?? this.currentClientSessionEvents;
+    const plainText = JSON.stringify({
+      Score: wholeScore,
+      RunId: runId,
+      ...(Object.keys(collected).length > 0 ? { Collected: { ...collected } } : {}),
+      ...(gameEvents.length > 0 ? { GameEvents: [...gameEvents] } : {})
+    });
+
+    // Same encrypt-and-sign scheme as EndRoomSP, keyed on the player's UserId instead of a session
+    // id: its decimal digits, padded on the left with zeros to 8, first 8 characters.
+    const userIdPart = String(user.UserId).padStart(8, '0').substring(0, 8);
+    const encryptionKey = userIdPart + this.config.privateGameKey.substring(0, 8);
+    const encryptedData = await CryptoHelper.encrypt(plainText, encryptionKey);
+    const hash = await CryptoHelper.hmacSha256(encryptedData, this.config.privateGameKey.substring(8));
+
+    const response = await fetch(`${this.apiUri}/User/complete-practice`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ Data: encryptedData, Hash: hash })
+    });
+    if (!response.ok) {
+      throw new Error(`Failed to complete practice: ${await response.text()}`);
+    }
+    await response.text();
+
+    // The run is over: the next one gets a new id and starts with nothing recorded.
+    if (this.practiceRunId === runId) {
+      this.practiceRunId = null;
+    }
+    this.currentClientSessionCollected.clear();
+    this.currentClientSessionEvents = [];
+    return true;
+  }
+
   /* ================= Hall of Fame Methods ================= */
 
   /**
@@ -3942,7 +4031,8 @@ export class FunticoSDK {
 
   /**
    * Counts an item the player collected during the current run, such as a chest. The counts are
-   * sent with the result by EndRoomSP and ResultTournament_Client, also when the run was lost.
+   * sent with the result by EndRoomSP, ResultTournament_Client and CompletePractice, also when the
+   * run was lost.
    *
    * @param key The reward key agreed for your game, for example "chest_1".
    * @param count How many to add. Use it to re-record what a resumed run had collected.
@@ -4205,15 +4295,29 @@ export class FunticoSDK {
   /**
    * Reports the fight of a match, once. A repeated report returns the first result. The result
    * is encrypted and signed like a campaign completion.
+   *
+   * @param fightHash Optional: your hash of the fight (up to 128 characters), kept with the match
+   *                  so the fight can be checked later.
+   * @param matchData Optional: your evidence for a later check of this fight, in your own format
+   *                  (for example your run's log up to and including this fight). It is signed
+   *                  together with the report and kept with the match; left out when empty. At most
+   *                  32 KB in UTF-8: a larger one rejects with `DataTooLarge`, nothing is recorded
+   *                  and the match stays open, so report again without it.
    */
-  public async ReportGhostResult(matchId: string, outcome: GhostOutcome, fightHash: string | null = null): Promise<GhostReportResult> {
+  public async ReportGhostResult(matchId: string, outcome: GhostOutcome, fightHash: string | null = null,
+    matchData: string | null = null): Promise<GhostReportResult> {
     const headers = this.getAuthHeaders();
     if (!(Object.values(GhostOutcome) as string[]).includes(outcome)) {
       throw new GhostError(GhostErrorCode.InvalidOutcome, `Outcome must be Win, Loss or Draw, got "${outcome}".`);
     }
 
     const id = String(matchId).toLowerCase();
-    const plainText = JSON.stringify({ MatchId: id, Outcome: outcome, FightHash: fightHash });
+    const plainText = JSON.stringify({
+      MatchId: id,
+      Outcome: outcome,
+      FightHash: fightHash,
+      ...(typeof matchData === 'string' && matchData.length > 0 ? { MatchData: matchData } : {})
+    });
     const encryptionKey = id.substring(0, 8) + this.config.privateGameKey.substring(0, 8);
     const encryptedData = await CryptoHelper.encrypt(plainText, encryptionKey);
     const hash = await CryptoHelper.hmacSha256(encryptedData, this.config.privateGameKey.substring(8));

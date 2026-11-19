@@ -10,14 +10,15 @@ For installation and a quick-start integration walkthrough, see [README.md](./RE
 2. [User Data Methods](#user-data-methods)
 3. [Rooms & Tournament Methods](#rooms--tournament-methods)
 4. [Special Tournaments Methods](#special-tournaments-methods)
-5. [Hall of Fame Methods](#hall-of-fame-methods)
-6. [Campaign Methods](#campaign-methods)
-7. [Inventory Methods](#inventory-methods)
-8. [Ghost Matchmaking Methods](#ghost-matchmaking-methods)
-9. [Community Goal Methods](#community-goal-methods)
-10. [Client Session Methods (Reconnection)](#client-session-methods-reconnection)
-11. [Phaser Plugin Integration](#phaser-plugin-integration)
-12. [Utilities & Types](#utilities--types)
+5. [Practice Methods](#practice-methods)
+6. [Hall of Fame Methods](#hall-of-fame-methods)
+7. [Campaign Methods](#campaign-methods)
+8. [Inventory Methods](#inventory-methods)
+9. [Ghost Matchmaking Methods](#ghost-matchmaking-methods)
+10. [Community Goal Methods](#community-goal-methods)
+11. [Client Session Methods (Reconnection)](#client-session-methods-reconnection)
+12. [Phaser Plugin Integration](#phaser-plugin-integration)
+13. [Utilities & Types](#utilities--types)
 
 ---
 
@@ -1731,6 +1732,68 @@ async submitTournamentResult(tournamentId: string, saveScoreId: string) {
 
 ---
 
+## Practice Methods
+
+Practice is the free mode of your game: no room and no entry fee. When a practice run ends, submit its score with `CompletePractice`. The result is ranked in the Hall of Fame as a Practice result (`HallOfFameGameModeFilter.Practice`), and reward keys your game has opened for practice can pay run rewards.
+
+---
+
+### `CompletePractice`
+
+Submits the result of a practice run, encrypted and signed. Call it once, when the run is over.
+
+**Signature:**
+```typescript
+public async CompletePractice(score: number, options: CompletePracticeOptions = {}): Promise<boolean>
+```
+
+**Parameters:**
+- `score` - The run's final score. Fractional values are truncated toward zero (e.g. `47.9` is submitted as `47`). The result must fit a 32-bit integer (`-2147483648` to `2147483647`): `NaN`, `Infinity`, a value that is not a number, or one out of that range throws an `Error` before anything is sent.
+- `options.collected` - Optional: counts to send instead of what `RecordCollected_Client` recorded, by reward key.
+- `options.gameEvents` - Optional: events to send instead of what `RecordEvent_Client` recorded.
+
+**Returns:** `Promise<boolean>` - Resolves `true` once the result is recorded. Rejects with an `Error` carrying the server's message when the result is refused, and with the `fetch` error on a network failure.
+
+**What goes with the result:**
+- The counts recorded with `RecordCollected_Client`. Only keys your game has opened for practice earn something here.
+- The events recorded with `RecordEvent_Client`: your evidence of how the score came about, for a later check of this run, in your own format.
+- Empty counts and an empty event list are left out of the payload.
+
+**Retrying.** Each practice run carries an id the SDK makes for it. A failed submit (a rejection or a network error) keeps that id, the recorded counts and the events, so calling `CompletePractice` again resends the same run and its rewards are not paid twice. A delivered result clears the recorded counts and events (also when you passed your own in `options`), and the next run gets a new id.
+
+The SDK encrypts and signs the payload with `privateGameKey`, keyed on the player's `UserId`. Pass the plain score; never encrypt anything yourself.
+
+**Usage:**
+```typescript
+async practiceOver() {
+  const runStarted = this.registry.get('practiceStarted') as Date;
+  try {
+    await this.funtico.sdk.CompletePractice(this.score);
+  } catch (err) {
+    console.error('Failed to save the practice result:', err);
+    this.showRetryButton(); // calling CompletePractice again resends the same run
+    return;
+  }
+
+  const recent = await this.funtico.sdk.GetRecentRewards(20, runStarted);
+  this.scene.start('PracticeResultsScene', { score: this.score, rewards: recent.Rewards });
+}
+```
+
+```typescript
+// Send your own log instead of the recorded events (the recorded ones are still cleared on success)
+await this.funtico.sdk.CompletePractice(this.score, {
+  gameEvents: this.runLog.map(entry => JSON.stringify(entry))
+});
+```
+
+**Important Notes:**
+- Requires a signed-in player. The player's `UserId` comes from the cached user data; when none is cached, the SDK loads it first (one extra request).
+- Practice needs no `CreateSession_Client`, and `CompletePractice` does not close a tracked client session.
+- When a practice run is abandoned without a result, call `CloseCurrentSession_Client()` so its events and counts do not travel with the next run.
+
+---
+
 ## Hall of Fame Methods
 
 The Hall of Fame is the platform-wide ranking built from every scored run a player has submitted — through Special Tournaments, Rooms, or Practice. Games typically use it to render an all-time or monthly leaderboard screen and the prize table that goes with it.
@@ -2626,13 +2689,19 @@ Reports the outcome of a match, once. The result is encrypted and signed with yo
 
 **Signature:**
 ```typescript
-public async ReportGhostResult(matchId: string, outcome: GhostOutcome, fightHash: string | null = null): Promise<GhostReportResult>
+public async ReportGhostResult(
+  matchId: string,
+  outcome: GhostOutcome,
+  fightHash: string | null = null,
+  matchData: string | null = null
+): Promise<GhostReportResult>
 ```
 
 **Parameters:**
 - `matchId` - `Match.MatchId` from `FindGhostOpponent`.
 - `outcome` - `GhostOutcome.Win`, `GhostOutcome.Loss` or `GhostOutcome.Draw`, from the player's point of view.
 - `fightHash` - Optional: your game's hash of the fight (up to 128 characters), kept with the match for a later replay check.
+- `matchData` - Optional: your evidence for a later check of this fight, in your own format (for example your run's log up to and including this fight). It is signed together with the report and kept with the match; an empty string is the same as none. At most 32 KB in UTF-8: a larger one rejects with `DataTooLarge`, nothing is recorded and the match stays open, so report again without it.
 
 **Returns:** `GhostReportResult` with `MatchId`, `Outcome`, `PlayerRatingBefore`, `PlayerRatingAfter`, `OpponentRatingBefore`, `OpponentRatingAfter` and `Run`.
 
@@ -2640,9 +2709,18 @@ A repeated report of the same match returns the first result unchanged, so retry
 
 **Usage:**
 ```typescript
-import { GhostOutcome } from './sdk/FunticoPhaserSDK';
+import { GhostError, GhostErrorCode, GhostOutcome } from './sdk/FunticoPhaserSDK';
 
-const result = await this.funtico.sdk.ReportGhostResult(match.MatchId, won ? GhostOutcome.Win : GhostOutcome.Loss);
+const outcome = won ? GhostOutcome.Win : GhostOutcome.Loss;
+const matchData = JSON.stringify({ v: 1, log: this.fightLog });
+let result;
+try {
+  result = await this.funtico.sdk.ReportGhostResult(match.MatchId, outcome, fightHash, matchData);
+} catch (error) {
+  if (!(error instanceof GhostError) || error.Code !== GhostErrorCode.DataTooLarge) throw error;
+  result = await this.funtico.sdk.ReportGhostResult(match.MatchId, outcome, fightHash); // the match is still open
+}
+
 this.showRatingChange(result.PlayerRatingBefore, result.PlayerRatingAfter);
 if (result.Run && result.Run.Status !== 'Active') {
   this.showRunSummary(result.Run);
@@ -2728,6 +2806,7 @@ The error every Ghost method rejects with.
 - `MatchExpired` - The match was closed before it was reported.
 - `InvalidSignature` - The report could not be verified. Check your game's private key.
 - `InvalidOutcome` - The outcome is not `Win`, `Loss` or `Draw`.
+- `DataTooLarge` - The report's `matchData` is over 32 KB in UTF-8. Nothing was recorded and the match stays open: report again without it.
 - `Unknown` - The response carried no recognisable code.
 
 ---
@@ -3259,8 +3338,8 @@ export class GameScene extends Phaser.Scene {
 
 **Important Notes:**
 - Synchronous and local — events are buffered in memory and only leave the client when the match is finalised.
-- The buffer is attached automatically as `GameEvents` when you call `ResultTournament_Client`, and by `EndRoomSP` whenever you leave its `gameEvents` argument empty.
-- The buffer is reset by `CreateSession_Client`, `ReconnectToUnfinishedSession_Client`, and `CloseCurrentSession_Client`.
+- The buffer is attached automatically as `GameEvents` when you call `ResultTournament_Client`, `CompleteCampaignLevel` or `CompletePractice`, and by `EndRoomSP` whenever you leave its `gameEvents` argument empty.
+- The buffer is reset by `CreateSession_Client`, `ReconnectToUnfinishedSession_Client`, and `CloseCurrentSession_Client`, and once `CompleteCampaignLevel` or `CompletePractice` delivers it.
 
 ---
 
@@ -3287,10 +3366,10 @@ export class GameScene extends Phaser.Scene {
 ```
 
 **Important Notes:**
-- Synchronous and local. The counts leave the client with the result of `EndRoomSP` or `ResultTournament_Client`, including when the run was lost (`isSuccess: false`).
-- Each key has a limit per run. Agree it together with the key, so that a normal run cannot exceed it.
+- Synchronous and local. The counts leave the client with the result of `EndRoomSP`, `ResultTournament_Client` or `CompletePractice`, including when the run was lost (`isSuccess: false`).
+- Each key has a limit per run. Agree it together with the key, so that a normal run cannot exceed it. A key earns something in practice only when your game has opened it for practice.
 - `CreateSession_Client`, `ReconnectToUnfinishedSession_Client`, and `CloseCurrentSession_Client` reset the counts. To keep them across a reconnect, store them in your session state and record them again with `count` after resuming.
-- A failed `EndRoomSP` or `ResultTournament_Client` keeps the counts, so a retry still sends them. `CompletePractice` and `CompleteCampaignLevel` do not send them: do not record anything in those modes.
+- A failed `EndRoomSP`, `ResultTournament_Client` or `CompletePractice` keeps the counts, so a retry still sends them. `CompleteCampaignLevel` does not send them: do not record anything in campaign runs.
 - An invalid call (empty key, or a count that is not a positive integer) logs an error and is ignored.
 
 ---
@@ -3315,7 +3394,7 @@ Returns everything recorded so far in the current session via `RecordEvent_Clien
 public GetCurrentSessionEvents_Client(): string[]
 ```
 
-**Returns:** `string[]` - A copy of the recorded event strings, in the order they were recorded. Empty when nothing has been recorded yet, or after the session was closed or reconnected. Mutating the returned array does not affect the SDK's internal buffer.
+**Returns:** `string[]` - A copy of the recorded event strings, in the order they were recorded. Empty when nothing has been recorded yet, after the session was closed or reconnected, or after a delivered campaign or practice result. Mutating the returned array does not affect the SDK's internal buffer.
 
 **Usage:**
 ```typescript
