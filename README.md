@@ -170,6 +170,22 @@ const tier = await this.funtico.sdk.GetTierByEventId("event-guid");
    const myRow = board.LeaderboardItems.find(i => i.UserId === me?.PlatformId);
    ```
 
+### External (PvP) Matches
+For external rooms (`GetRooms(2)`), your own matchmaking forms the match. Your game server makes one
+match UUID and hands it to every player of the match; each of them registers with it:
+```typescript
+const sessionData = await this.funtico.sdk.JoinExternalMatch(roomGuid, matchId);
+```
+When the match is over, your game server (trusted code that holds the private game key) reports
+every player's final score under the same match id:
+```typescript
+await sdk.FinishRoomSession_Server(roomGuid, matchId, [
+  { Score: 1200, UserId: 17, FunticoUserId: 1001, UserIp: '203.0.113.10' },
+  { Score: null, UserId: 18, FunticoUserId: 1002, UserIp: '203.0.113.11' } // left the match
+]);
+```
+Once every player has a score, the prizes are paid by place automatically.
+
 ---
 
 ## 5. Special Tournaments

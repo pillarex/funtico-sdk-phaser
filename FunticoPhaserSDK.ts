@@ -3088,6 +3088,75 @@ export class FunticoSDK {
   }
 
   /**
+   * Registers the player in a match of an external (PvP) room that your own matchmaking formed.
+   *
+   * Every player of the match calls it with the same matchId: a UUID your game server makes once
+   * per match. The room's entry fee, if any, is charged here. When the match is over, your game
+   * server reports every player's final score under the same matchId with FinishRoomSession_Server;
+   * prizes are paid by place once every player of the match has a score.
+   *
+   * JoinRoom is for regular rooms: it takes no match id, so it cannot put two chosen players into
+   * the same match.
+   *
+   * Calling it again for the same match resolves to the same match, so a retry is safe. If the
+   * player still has an unfinished game in this room under another id, this rejects: that game has
+   * to be finished first.
+   *
+   * @param eventId    The room's id (an external room: GetRooms(2) lists them).
+   * @param matchId    The match's UUID, the same for all of its players.
+   * @param password   The room's password, for a room that has one.
+   * @param useVoucher Spend a free-entry voucher instead of the entry fee.
+   * @returns The room session to report under; SessionOrMatchId is the match id.
+   */
+  public async JoinExternalMatch(
+    eventId: string,
+    matchId: string,
+    password?: string,
+    useVoucher = false
+  ): Promise<RoomSessionData> {
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    if (!uuid.test(eventId) || !uuid.test(matchId)) {
+      throw new Error("JoinExternalMatch: eventId and matchId must be UUIDs");
+    }
+    const room = eventId.toLowerCase();
+    const match = matchId.toLowerCase();
+
+    // The password travels encrypted, keyed on the room id.
+    const encryptedPassword = password ? await CryptoHelper.encrypt(password, room) : '';
+
+    const url = `${this.apiUri}/Rooms/join-room?idempotencyKey=${this.newIdempotencyKey()}&getLobbyQuote=false`;
+    const response = await fetch(url, {
+      method: "POST",
+      headers: this.getAuthHeaders(true),
+      body: JSON.stringify({
+        tournamentId: room,
+        communityId: null,
+        password: encryptedPassword,
+        UseVoucher: useVoucher
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(`Failed to join external match: ${await response.text()}`);
+    }
+
+    const joinResponse: WireJoinRoomResponse = await response.json();
+
+    // The player already has a game in this room: the same match is a rejoin, any other one has to
+    // be finished first.
+    const existing = joinResponse.game_session_id_or_match_id;
+    if (typeof existing === 'string' && existing.trim().length > 0) {
+      if (existing.trim().toLowerCase() === match) {
+        return { EventId: eventId, SessionOrMatchId: match };
+      }
+      throw new Error(`Failed to join external match: the player has an unfinished game ${existing} in this room. Finish it before joining another match.`);
+    }
+
+    const started = await this.StartRoomSP(room, match, false);
+    return { EventId: eventId, SessionOrMatchId: started.SessionOrMatchId || match };
+  }
+
+  /**
    * Ends a room session and sends the player's encrypted score to the game API (Client-side).
    *
    * The score is encrypted and signed with privateGameKey. If this fails with HTTP 500 "Padding is
@@ -4711,7 +4780,12 @@ export class FunticoSDK {
 
   /* ================= Dedicated Server Session Methods =================
    *
-   * NOTE: The Dedicated Server methods are not supported at the moment; do not use them.
+   * FinishRoomSession_Server is supported: a trusted game server reports the final scores of an
+   * external match with it (see JoinExternalMatch). RecordEvent_Server and
+   * GetCurrentSessionEvents_Server are local and work.
+   *
+   * NOTE: CreateSession_Server, UserLeaveSession_Server and CloseCurrentSession_Server are not
+   * supported at the moment; do not use them.
    */
 
   /**
@@ -4779,22 +4853,33 @@ export class FunticoSDK {
   }
 
   /**
-   * Submits multiplayer results for all match participants in one payload from Dedicated Server.
+   * Reports the final scores of a finished match for all of its players in one call, from your
+   * trusted game server. It is the last step of an external match (see JoinExternalMatch): pass the
+   * match id as sessionId. The prizes are paid by place once every player of the match has a score.
    *
-   * The request body is a root `scores` array with one entry per participant, each of which
-   * carries its own session id. Every key is snake_case.
+   * It authenticates as your game, so the private game key must be present: call it only from
+   * server code, never from a browser build.
+   *
+   * The request body is a root `scores` array with one entry per participant, all under the same
+   * match id. Every key is snake_case.
    *
    * Note `user_id` is the FUNTICO user id (FunticoUserId), not UserId; results (including Hall of
    * Fame) are recorded against it.
    *
+   * A null Score means the player left or was kicked before finishing. GameManagedAward is sent
+   * only when it is a number.
+   *
    * AdditionalData and GameEvents are not transmitted; they stay on the parameter for source
    * compatibility.
+   *
+   * @returns true once every score is recorded. Rejects with the server's text when the call fails
+   *          or any of the scores is refused; the local server-session tracking is then kept.
    */
   public async FinishRoomSession_Server(
     eventId: string,
     sessionId: string,
     participants: Array<{
-      Score: number;
+      Score: number | null;
       UserId: number;
       FunticoUserId: number;
       UserIp: string;
@@ -4805,12 +4890,13 @@ export class FunticoSDK {
   ): Promise<boolean> {
     const scores = participants.map(p => ({
       game_session_id_or_match_id: sessionId,
-      // Must be an integer; truncate so a fractional score cannot fail the request.
-      score: Math.trunc(p.Score),
+      // Must be an integer; truncate so a fractional score cannot fail the request. Null: the player left.
+      score: p.Score == null ? null : Math.trunc(p.Score),
       is_suspected_cheater: false,
       user_ip_end_session: p.UserIp,
       user_id: p.FunticoUserId,
-      game_managed_award: p.GameManagedAward ?? null
+      // Only a number is accepted here; leave the field out otherwise.
+      ...(typeof p.GameManagedAward === 'number' ? { game_managed_award: p.GameManagedAward } : {})
     }));
 
     const response = await fetch(`${this.apiUri}/Rooms/end-room-all-users?eventId=${eventId}`, {
@@ -4819,13 +4905,25 @@ export class FunticoSDK {
       body: JSON.stringify({ scores })
     });
 
-    if (!response.ok) throw new Error("Failed to finalize server match results");
+    const text = await response.text();
+    if (!response.ok) throw new Error(`Failed to finalize server match results: ${text}`);
+
+    // The answer lists a result per score; a refused one means the match is not settled.
+    let results: unknown;
+    try {
+      results = JSON.parse(text)?.results;
+    } catch {
+      results = undefined;
+    }
+    if (Array.isArray(results) && results.some(r => typeof r?.status === 'number' && r.status >= 400)) {
+      throw new Error(`Failed to finalize server match results: ${text}`);
+    }
 
     // Cleanup session tracking
     this.activeServerSessionId = null;
     this.activeServerSessionEvents.clear();
 
-    return await response.json();
+    return true;
   }
 
   public RecordEvent_Server(platformUserId: number, eventInfo: string): void {

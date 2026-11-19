@@ -1119,6 +1119,42 @@ const session = await this.funtico.sdk.JoinRoom(room.Guid, room.UserCanJoinWithV
 
 ---
 
+### `JoinExternalMatch`
+
+Registers the player in a match of an external (PvP) room that your own matchmaking formed. Use it instead of `JoinRoom` for external rooms (the ones `GetRooms(2)` lists): `JoinRoom` takes no match id, so it cannot put two chosen players into the same match.
+
+**Signature:**
+```typescript
+public async JoinExternalMatch(eventId: string, matchId: string, password?: string, useVoucher = false): Promise<RoomSessionData>
+```
+
+**Parameters:**
+- `eventId` - The room's id (`RoomViewModel.Guid`).
+- `matchId` - The match's UUID. Your game server makes it once per match and hands the same value to every player of that match.
+- `password` - The room's password, for a room that has one. The SDK encrypts it.
+- `useVoucher` - Spend a free-entry voucher instead of the entry fee. Default: `false`.
+
+**Returns:** `Promise<RoomSessionData>` - `EventId` and `SessionOrMatchId`, which is the match id. Rejects with an `Error` when the player cannot be registered (for example: not enough balance, wrong password).
+
+**Flow for one external match:**
+1. Your matchmaking pairs the players, and your game server makes one `matchId` (for example `crypto.randomUUID()`).
+2. Every player of the match calls `JoinExternalMatch(eventId, matchId)`. The room's entry fee, if any, is charged here.
+3. When the match is over, your game server reports every player's final score under the same `matchId` with `FinishRoomSession_Server(eventId, matchId, participants)` (`null` for a player who left). Call it only from trusted server code: it needs the private game key.
+4. Once every player of the match has a score, the prizes are paid by place automatically. `GetLeaderboard(eventId, matchId)` shows the result.
+
+Calling it again for the same match resolves to the same match, so a retry is safe. If the player still has an unfinished game in this room under another id, it rejects: that game has to be finished first.
+
+**Usage:**
+```typescript
+// matchId comes from your game server, the same for every player of the match
+const session = await this.funtico.sdk.JoinExternalMatch(roomGuid, matchId);
+
+this.registry.set('activeSession', session);
+this.scene.start('MatchScene');
+```
+
+---
+
 ### `EndRoomSP`
 
 Ends a room run and submits the player's score from the client, encrypted and signed. Call it once, when the run is over.
