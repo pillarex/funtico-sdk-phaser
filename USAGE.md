@@ -30,7 +30,7 @@ Every SDK call is made through a single shared `FunticoSDK` instance. A game boo
 
 ### `FunticoConfig`
 
-The configuration object passed to `Initialize`. It carries the environment selection, the two game keys issued by the Funtico Developer Portal, and optional overrides for the API endpoint and cache lifetime.
+The configuration object passed to `Initialize`. It carries the environment selection, the two game keys issued by the Funtico Developer Portal, and optional overrides for the API endpoint and cache lifetime. A game that keeps its secret key on its own server passes a [`FunticoSignerConfig`](#funticosignerconfig) instead.
 
 **Definition:**
 ```typescript
@@ -42,6 +42,7 @@ export interface FunticoConfig {
   apiBaseUrl?: string;         // Custom URL for your game's API
   funticoApiBaseUrl?: string;  // Custom URL for the Funtico platform API
   cacheTTL?: number;           // Cache lifetime in milliseconds (default: 30000ms)
+  payloadSigner?: undefined;   // Not used with privateGameKey (see FunticoSignerConfig)
 }
 ```
 
@@ -65,6 +66,161 @@ const config: FunticoConfig = {
   userToken: new URLSearchParams(window.location.search).get('token') ?? undefined,
   cacheTTL: 60000 // keep profile/balance/vouchers warm for a minute
 };
+```
+
+---
+
+### `FunticoSignerConfig`
+
+The configuration for a game that keeps its secret key off the client: every field of `FunticoConfig`, with `payloadSigner` in place of `privateGameKey`. `Initialize` (and the plugin's `init`) take either config.
+
+**Definition:**
+```typescript
+export interface FunticoSignerConfig extends Omit<FunticoConfig, 'privateGameKey' | 'payloadSigner'> {
+  payloadSigner: PayloadSigner;  // Signs every result and encrypts the saved session
+  privateGameKey?: undefined;    // Not used with a signer: leave it out
+}
+```
+
+**FunticoSignerConfig Properties:**
+- `payloadSigner` ([`PayloadSigner`](#payloadsigner)) - Signs every result the SDK submits and encrypts and decrypts the saved session, usually by asking your own backend, where the secret key lives. The SDK then never needs the key.
+- `privateGameKey` - Leave it out. A config with both a `privateGameKey` and a `payloadSigner` is rejected by `Initialize`, and does not type-check.
+- Every other property (`env`, `publicGameKey`, `userToken`, `apiBaseUrl`, `funticoApiBaseUrl`, `cacheTTL`) is the same as in [`FunticoConfig`](#funticoconfig).
+
+The server-only calls (`ResultTournament_Server`, `FinishRoomSession_Server`) send an `X-Server-Key` derived from the secret key. Without the key the SDK sends no `X-Server-Key`, so run those on a trusted server initialized with `FunticoConfig`.
+
+**Usage:**
+```typescript
+import { FunticoEnvironment, FunticoSignerConfig } from './sdk/FunticoPhaserSDK';
+
+const config: FunticoSignerConfig = {
+  env: FunticoEnvironment.STAGING,
+  publicGameKey: 'your-public-key',
+  payloadSigner: myBackendSigner, // see PayloadSigner
+  userToken: new URLSearchParams(window.location.search).get('token') ?? undefined
+};
+```
+
+---
+
+### `PayloadSigner`
+
+Signs the results the SDK submits and encrypts the saved session. When `Initialize` gets a `privateGameKey`, the SDK uses [`LocalPayloadSigner`](#localpayloadsigner) with that key. A game that keeps the key off the client passes its own signer in [`FunticoSignerConfig`](#funticosignerconfig), typically one that forwards each call to the game's backend, where the key lives.
+
+**Definition:**
+```typescript
+export interface PayloadSigner {
+  Sign(kind: PayloadKind, saltId: string, payloadJson: string): Promise<SignedPayload | null>;
+  EncryptSession(userId: string, sessionJson: string): Promise<string | null>;
+  DecryptSession(userId: string, encryptedData: string): Promise<string | null>;
+}
+
+export interface SignedPayload {
+  Data: string;  // The encrypted payload (Base64)
+  Hash: string;  // Its signature (lowercase hex)
+}
+
+export enum PayloadKind {
+  Practice = 0,
+  Room = 1,
+  Tournament = 2,
+  Campaign = 3,
+  Ghost = 4,
+  CommunityGoal = 5
+}
+```
+
+**Methods:**
+- `Sign(kind, saltId, payloadJson)` - Encrypts and signs one result. `kind` says which result it is, `saltId` is the id the encryption key is salted with, and `payloadJson` is the exact JSON to encrypt. Returns the `SignedPayload`, or `null` on failure.
+- `EncryptSession(userId, sessionJson)` - Encrypts a session checkpoint. Returns the encrypted session, or `null` on failure.
+- `DecryptSession(userId, encryptedData)` - Decrypts a saved session as the API returned it. Returns the session JSON, or `null` on failure.
+
+**Which call uses what:**
+
+| SDK call | Signer method | `kind` | `saltId` / `userId` |
+|---|---|---|---|
+| `CompletePractice` | `Sign` | `Practice` | the player's `UserId`, as a decimal string |
+| `EndRoomSP` | `Sign` | `Room` | `sessionOrMatchId`, as passed |
+| `ResultTournament_Client` | `Sign` | `Tournament` | `saveScoreId`, as passed |
+| `CompleteCampaignLevel` | `Sign` | `Campaign` | the attempt's `AttemptId` |
+| `ReportGhostResult` | `Sign` | `Ghost` | `matchId`, lowercased |
+| `CompleteGoalAttempt` | `Sign` | `CommunityGoal` | the attempt's `AttemptId`, lowercased |
+| `CreateSession_Client`, `UpdateSession_Client` | `EncryptSession` | | the player's `UserId`, as a decimal string |
+| `ReconnectToUnfinishedSession_Client` | `DecryptSession` | | the player's `UserId`, as a decimal string |
+
+**Writing a signer:**
+- It must return exactly what `LocalPayloadSigner` returns for the same arguments and your secret key; the API cannot tell the two apart. The usual signer sends the arguments to your backend, which runs `LocalPayloadSigner` (or the same algorithm) with the key and returns its answer.
+- Ids arrive whole, never shortened; the key salt is derived from them as `LocalPayloadSigner.Salt` does.
+- Encrypt `payloadJson` and `sessionJson` exactly as given. Never parse and re-serialise them.
+- Authenticate the call to your backend with the player's game token (`getUserToken()`), and have the backend find out from that token who the player is. Sign a `Practice` result and encrypt or decrypt a session only for that player's `UserId`, whatever the request says.
+- A signer signs whatever it is sent, so the backend should check a result before signing it.
+- Return `null` when signing fails (also for a refusal). An empty string, a `SignedPayload` with an empty `Data` or `Hash`, or anything else that is not a usable answer counts as `null`. A signer that throws passes its exception to the game's call unchanged.
+
+**When the signer returns `null`:** nothing is sent, the call rejects, and what a retry needs is kept:
+
+| SDK call | Rejects with | What is kept |
+|---|---|---|
+| `EndRoomSP` | `Error("Failed to end gameplay session: the result could not be signed, so it was not sent.")` | the client session, its events and counts |
+| `ResultTournament_Client` | `Error("Failed to submit client tournament result: the result could not be signed, so it was not sent.")` | the client session, its events and counts |
+| `CompletePractice` | `Error("Failed to complete practice: the result could not be signed, so it was not sent.")` | the run id, the counts and the events |
+| `CompleteCampaignLevel` | `CampaignError`, `Code: Unknown` | the tracked attempt and the events |
+| `ReportGhostResult` | `GhostError`, `Code: Unknown` | the open match: report again with the same match id |
+| `CompleteGoalAttempt` | `CommunityGoalError`, `Code: Unknown` | the attempt: complete it again |
+| `CreateSession_Client` | `Error("Failed to create client session: the session could not be encrypted, so it was not saved.")` | no session is opened |
+| `UpdateSession_Client` | `Error("Failed to update client session progress: the session could not be encrypted, so it was not saved.")` | the open session |
+| `ReconnectToUnfinishedSession_Client` | `Error("Failed to reconnect to session: the saved session could not be decrypted.")` | nothing is restored |
+
+A signer may take as long as it needs: `UpdateSession_Client` saves into the session that was open when it was called, even if that session is closed while the signer answers.
+
+**Usage:**
+```typescript
+import { FunticoSDK, PayloadKind, PayloadSigner, SignedPayload } from './sdk/FunticoPhaserSDK';
+
+async function askBackend<T>(body: object): Promise<T | null> {
+  const response = await fetch('https://your-backend.example/funtico-sign', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${FunticoSDK.Instance.getUserToken()}` },
+    body: JSON.stringify(body)
+  });
+  return response.ok ? (await response.json()) as T : null;
+}
+
+export const myBackendSigner: PayloadSigner = {
+  Sign: (kind: PayloadKind, saltId: string, payloadJson: string) => askBackend<SignedPayload>({ op: 'sign', kind, saltId, payloadJson }),
+  EncryptSession: (userId: string, sessionJson: string) => askBackend<string>({ op: 'encryptSession', userId, data: sessionJson }),
+  DecryptSession: (userId: string, encryptedData: string) => askBackend<string>({ op: 'decryptSession', userId, data: encryptedData })
+};
+```
+
+---
+
+### `LocalPayloadSigner`
+
+The signer the SDK uses when `Initialize` gets a `privateGameKey`, and the reference for every other `PayloadSigner`. It needs only Web Crypto, so it also runs on a Node 20+ backend; there, take it from the [Funtico JS SDK](https://github.com/pillarex/FunticoJSSDK), which is built from this SDK without Phaser.
+
+**Definition:**
+```typescript
+export class LocalPayloadSigner implements PayloadSigner {
+  constructor(privateKey: string);
+  static Salt(kind: PayloadKind, saltId: string): string;
+  Sign(kind: PayloadKind, saltId: string, payloadJson: string): Promise<SignedPayload>;
+  EncryptSession(userId: string, sessionJson: string): Promise<string>;
+  DecryptSession(userId: string, encryptedData: string): Promise<string>;
+}
+```
+
+**Members:**
+- `constructor(privateKey)` - The game's secret key from the Developer Portal.
+- `Salt(kind, saltId)` - The salt in front of the encryption key: the first 8 characters of `saltId`. For `Practice`, the decimal `UserId` is first padded on the left with zeros to 8 digits.
+- `Sign`, `EncryptSession`, `DecryptSession` - As described under [`PayloadSigner`](#payloadsigner). `DecryptSession` rejects when the data was not encrypted with this key for this player.
+
+**Usage:**
+```typescript
+// Your backend (Node 20+): the key comes from the server's environment, never from a client.
+import { LocalPayloadSigner, PayloadKind } from 'funtico-sdk-js';
+
+const signer = new LocalPayloadSigner(process.env.FUNTICO_PRIVATE_KEY!);
+const signed = await signer.Sign(PayloadKind.Room, sessionOrMatchId, payloadJson); // { Data, Hash }
 ```
 
 ---
@@ -127,17 +283,17 @@ Configures the SDK and, when a `userToken` is supplied, signs the player in and 
 
 **Signature:**
 ```typescript
-public async Initialize(config: FunticoConfig): Promise<void>
+public async Initialize(config: FunticoConfig | FunticoSignerConfig): Promise<void>
 ```
 
 **Parameters:**
-- `config` - The `FunticoConfig` object described above: environment, game keys, and optional platform token, API URL override and cache TTL.
+- `config` - The `FunticoConfig` object described above: environment, game keys, and optional platform token, API URL override and cache TTL. Or a `FunticoSignerConfig`, which carries a `payloadSigner` in place of `privateGameKey`, so that the secret key can stay on your server (see [`PayloadSigner`](#payloadsigner)).
 
 **Returns:** `Promise<void>` - Resolves once the base URL is resolved and — if `config.userToken` was supplied — authentication has completed and the cache pre-warm has settled.
 
 **What it does, in order:**
 1. Validates the game keys in `config` (see **Throws** below). If any check fails, `Initialize` rejects right here: nothing is stored and no request is sent.
-2. Stores `config` on the instance, so `publicGameKey`, `privateGameKey` and `cacheTTL` are available to every later call.
+2. Stores `config` on the instance, so `publicGameKey`, `privateGameKey` and `cacheTTL` are available to every later call. Every later result and session checkpoint is signed by `config.payloadSigner` when there is one, and with `privateGameKey` (through `LocalPayloadSigner`) otherwise.
 3. Resolves the API base URL: `config.apiBaseUrl` if provided, otherwise `https://funtico-sdk-staging.azurewebsites.net` for `FunticoEnvironment.STAGING` or `https://funtico-sdk.azurewebsites.net` for `FunticoEnvironment.PROD`.
 4. Resolves the Funtico **platform** base URL separately: `config.funticoApiBaseUrl` if provided, otherwise `https://staging.api.funtico.com` for `STAGING` or `https://api.funtico.com` for `PROD`. This is the host `GetLeaderboard` reads player names and avatars from; it is not the same host as the one in step 3.
 5. If `config.userToken` is set, awaits `Authentication(config.userToken)` to exchange the platform token for the game JWT.
@@ -159,6 +315,13 @@ The config is rejected when:
 - `privateGameKey` is shorter than 8 characters. Such a key can never work with encrypted submissions.
 - `privateGameKey` is identical to `publicGameKey`.
 - One key contains the other (`privateGameKey` contains `publicGameKey`, or the reverse). This means the keys were concatenated or pasted into one field — for example `privateGameKey: publicKey + secretKey`. Such a config still signs in, but every encrypted submission is rejected — on `/Rooms/end-room-sp` this surfaces as HTTP 500 `"Padding is invalid and cannot be removed"`, after a whole match has been played. Pass only the secret key from the Developer Portal in `privateGameKey`, and the public key alone in `publicGameKey`.
+
+A `FunticoSignerConfig` (one with a `payloadSigner`) skips the `privateGameKey` rules. It is rejected when:
+- it also has a `privateGameKey` (pass one or the other, never both);
+- `payloadSigner` lacks one of `Sign`, `EncryptSession` and `DecryptSession`;
+- `publicGameKey` is missing, not a string, empty, or has leading or trailing whitespace, as above.
+
+A `payloadSigner` of `null` or `undefined` counts as absent, so such a config needs a `privateGameKey`.
 
 These are the only checks. There are deliberately no format rules beyond them (no GUID shape, charset or exact-length checks): key formats differ between games, and a check must never reject a key the Developer Portal legitimately issued. The error messages never include the key values themselves — at most their lengths — so they are safe to forward to logs and error trackers.
 
@@ -194,6 +357,16 @@ await FunticoSDK.Instance.Initialize({
   env: FunticoEnvironment.PROD,
   publicGameKey: process.env.FUNTICO_PUBLIC_KEY!,
   privateGameKey: process.env.FUNTICO_PRIVATE_KEY!
+});
+```
+
+```typescript
+// Client build that keeps the secret key on your backend
+await FunticoSDK.Instance.Initialize({
+  env: FunticoEnvironment.PROD,
+  publicGameKey: 'your-public-key',
+  payloadSigner: myBackendSigner, // see PayloadSigner
+  userToken: platformToken
 });
 ```
 
@@ -1181,7 +1354,7 @@ public async EndRoomSP(
 
 **Returns:** `Promise<any>` - The backend's response to the score submission, returned untyped.
 
-The SDK encrypts and signs the payload for you — pass the plain `score` and never encrypt it yourself.
+The SDK encrypts and signs the payload for you — pass the plain `score` and never encrypt it yourself. With a `payloadSigner`, the signer signs it (kind `Room`, salt id `sessionOrMatchId`); when the signer fails, this rejects before anything is sent and keeps the client session, its events and counts for a retry.
 
 **Session auto-close:** on a successful response the SDK calls `CloseCurrentSession_Client()` for you, clearing the tracked client session ids and the recorded event log. You do not need to close the session manually, and any `UpdateSession_Client` call after this point will throw because no session is tracked any more.
 
@@ -1761,7 +1934,7 @@ async submitTournamentResult(tournamentId: string, saveScoreId: string) {
 
 **Important Notes:**
 - Only use in client builds — the server path is `ResultTournament_Server`.
-- The SDK encrypts and signs the payload for you; do not encrypt `customData` yourself.
+- The SDK encrypts and signs the payload for you; do not encrypt `customData` yourself. With a `payloadSigner`, the signer signs it (kind `Tournament`, salt id `saveScoreId`); when the signer fails, this rejects before anything is sent and keeps the client session.
 - Events recorded via `RecordEvent_Client` are attached to the payload automatically as `GameEvents`.
 - On success the SDK clears local client-session tracking via `CloseCurrentSession_Client()`.
 - Scoring an attempt spends the player's tournament registration: call `JoinTournament` again before the next `EnterTournament`.
@@ -1797,7 +1970,7 @@ public async CompletePractice(score: number, options: CompletePracticeOptions = 
 
 **Retrying.** Each practice run carries an id the SDK makes for it. A failed submit (a rejection or a network error) keeps that id, the recorded counts and the events, so calling `CompletePractice` again resends the same run and its rewards are not paid twice. A delivered result clears the recorded counts and events (also when you passed your own in `options`), and the next run gets a new id.
 
-The SDK encrypts and signs the payload with `privateGameKey`, keyed on the player's `UserId`. Pass the plain score; never encrypt anything yourself.
+The SDK encrypts and signs the payload with `privateGameKey` (or your `payloadSigner`, kind `Practice`), keyed on the player's `UserId`. Pass the plain score; never encrypt anything yourself.
 
 **Usage:**
 ```typescript
@@ -2316,7 +2489,7 @@ public async CompleteCampaignLevel(metrics: CampaignMetrics, attempt?: CampaignA
 
 **Returns:** `Promise<CampaignCompletionResult>` - The graded outcome. **A loss is a normal resolution** — `IsWin: false, Stars: 0` on a `200` — so render the defeat screen from this same object; only validation and state failures reject.
 
-The SDK encrypts and signs the payload for you with your `privateGameKey` — pass plain metrics and never encrypt anything yourself. Events recorded via `RecordEvent_Client` are folded into the encrypted payload automatically.
+The SDK encrypts and signs the payload for you with your `privateGameKey` (or your `payloadSigner`, kind `Campaign`) — pass plain metrics and never encrypt anything yourself. Events recorded via `RecordEvent_Client` are folded into the encrypted payload automatically.
 
 **Attempt handling on failure:** the tracked attempt is kept only for retryable failures — network errors and `Unknown` — so the game may retry the same submission after a blip. It is cleared for `AttemptNotFound` **and** `CompletionTooFast`: in both cases the server-side attempt is dead (unknown, or abandoned by the too-fast rejection itself), so a retry can never succeed and a fresh `StartCampaignLevel` is needed.
 
@@ -2388,7 +2561,7 @@ export class CampaignError extends Error {
 - `InvalidSignature` - The encrypted payload failed server-side verification. Almost always a wrong `privateGameKey`.
 - `InvalidMetrics` - The metrics violate the contract. Thrown client-side before any I/O when the SDK can see the violation itself; the same code arrives from the server for violations only it can detect.
 - `CompletionTooFast` - The run finished faster than the level's `MinDurationSeconds` allows. The server abandons the attempt when rejecting it, so the SDK clears its tracked attempt on this code too — start a new attempt.
-- `Unknown` - The response carried no recognisable code (an unparsable body, or an identifier newer than this SDK).
+- `Unknown` - The response carried no recognisable code (an unparsable body, or an identifier newer than this SDK), or your `payloadSigner` could not sign the result, so nothing was sent. The attempt stays tracked in both cases.
 
 `instanceof CampaignError` is reliable — the constructor restores the prototype chain explicitly — and `error.name` is `'CampaignError'`.
 
@@ -2721,7 +2894,7 @@ public async UploadGhostSnapshot(pool: string, attributes: Record<string, number
 
 ### `ReportGhostResult`
 
-Reports the outcome of a match, once. The result is encrypted and signed with your game's private key.
+Reports the outcome of a match, once. The result is encrypted and signed with your game's private key (or by your `payloadSigner`, kind `Ghost`).
 
 **Signature:**
 ```typescript
@@ -2843,7 +3016,7 @@ The error every Ghost method rejects with.
 - `InvalidSignature` - The report could not be verified. Check your game's private key.
 - `InvalidOutcome` - The outcome is not `Win`, `Loss` or `Draw`.
 - `DataTooLarge` - The report's `matchData` is over 32 KB in UTF-8. Nothing was recorded and the match stays open: report again without it.
-- `Unknown` - The response carried no recognisable code.
+- `Unknown` - The response carried no recognisable code, or your `payloadSigner` could not sign the report, so nothing was sent.
 
 ---
 
@@ -3074,7 +3247,7 @@ The error every Community Goal method rejects with. Besides `Code` it carries `N
 - `InvalidContribution` - The contribution is not a whole number of 0 or more.
 - `DataTooLarge` - `startData` (8 KB) or `strikeData` (16 KB) is too long in UTF-8. Nothing was spent or counted; the attempt stays open.
 - `StrikeNotFound` - No such best strike on this goal any more. Reload the leaderboard.
-- `Unknown` - The response carried no recognisable code.
+- `Unknown` - The response carried no recognisable code, or your `payloadSigner` could not sign the result, so nothing was sent.
 
 ---
 
@@ -3091,7 +3264,7 @@ Use these methods in **client builds** (browser / Telegram Mini App) to make a m
 
 **Encryption:**
 
-Your state never travels or rests in plaintext — `CreateSession_Client` and `UpdateSession_Client` encrypt and sign it for you, and `ReconnectToUnfinishedSession_Client` decrypts it on the way back. The SDK must have the player's user data cached before any of these calls; otherwise they throw `"User data is not loaded. Cannot derive session encryption key."` (`Initialize` pre-loads it for you when a `userToken` is supplied.)
+Your state never travels or rests in plaintext — `CreateSession_Client` and `UpdateSession_Client` encrypt and sign it for you, and `ReconnectToUnfinishedSession_Client` decrypts it on the way back. With a `payloadSigner`, the signer's `EncryptSession` and `DecryptSession` do the encryption (see [`PayloadSigner`](#payloadsigner)). The SDK must have the player's user data cached before any of these calls; otherwise they throw `"User data is not loaded. Cannot derive session encryption key."` (`Initialize` pre-loads it for you when a `userToken` is supplied.)
 
 **How checkpoints are saved:**
 
@@ -3547,7 +3720,7 @@ Initializes the SDK inside the Phaser lifecycle and announces the result on the 
 
 **Signature:**
 ```typescript
-public async init(config: FunticoConfig): Promise<void>
+public async init(config: FunticoConfig | FunticoSignerConfig): Promise<void>
 ```
 
 **Parameters:**
@@ -3557,8 +3730,9 @@ public async init(config: FunticoConfig): Promise<void>
 
 **FunticoConfig Properties:**
 - `env` (`FunticoEnvironment`) - Target environment: `FunticoEnvironment.STAGING` (`'staging'`) or `FunticoEnvironment.PROD` (`'prod'`). Selects the default API host when `apiBaseUrl` is not supplied.
-- `privateGameKey` (`string`) - Your game's secret key from the Funtico Developer Portal. Used to sign and encrypt payloads. Never ship it in a public client build.
+- `privateGameKey` (`string`) - Your game's secret key from the Funtico Developer Portal. Used to sign and encrypt payloads. Never ship it in a public client build: to keep it on your server, leave it out and pass `payloadSigner` instead (see [`FunticoSignerConfig`](#funticosignerconfig)).
 - `publicGameKey` (`string`) - Your game's public key from the Funtico Developer Portal, sent with every request.
+- `payloadSigner` ([`PayloadSigner`](#payloadsigner), `FunticoSignerConfig` only) - Signs results and encrypts the saved session in place of `privateGameKey`.
 - `userToken` (`string`, optional) - The player's Funtico platform token. When present, `Initialize` immediately authenticates the player and pre-loads user data, balance and vouchers, so cached getters work right after `init` resolves. Omit it to initialize the SDK unauthenticated and call `login()` later.
 - `apiBaseUrl` (`string`, optional) - Overrides the environment-derived API host. Point this at your game's own API gateway if you proxy Funtico requests. Default: `https://funtico-sdk-staging.azurewebsites.net` for `STAGING`, `https://funtico-sdk.azurewebsites.net` for `PROD`.
 - `cacheTTL` (`number`, optional) - Lifetime of the user-data / balance / voucher / campaign cache, in milliseconds. Once expired, calls with `useCache = true` hit the network again. Default: `30000`.
