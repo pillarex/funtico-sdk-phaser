@@ -946,6 +946,16 @@ export enum InventoryErrorCode {
   ReloginRequired = 'ReloginRequired',
   /** The Funtico platform did not answer. Try again later. */
   PlatformUnavailable = 'PlatformUnavailable',
+  /** A field of the request is missing or malformed, for example the IdempotencyKey or the id. */
+  InvalidRequest = 'InvalidRequest',
+  /** The game has no recipe or fusion with that key. */
+  UnknownRule = 'UnknownRule',
+  /** The IdempotencyKey was already used for a different action. Use a new key. */
+  KeyReused = 'KeyReused',
+  /** The picked copies do not fit the fusion: not the player's, not eligible, or the wrong count. */
+  WrongItems = 'WrongItems',
+  /** The game's recipes or fusions are set up wrong. Not something the player can fix. */
+  Misconfigured = 'Misconfigured',
   /** The response carried no recognisable code. */
   Unknown = 'Unknown'
 }
@@ -1007,6 +1017,95 @@ export interface InventoryItem {
 /** The player's items, as returned by GetInventory. */
 export interface InventoryResponse {
   Items: InventoryItem[];
+}
+
+/** One line of a recipe: an item and how many of it. */
+export interface CraftRecipeItem {
+  /**
+   * Your game's own item key. It may contain the placeholder "{id}", which CraftItem fills with the
+   * id you pass (for example "sg_shard_{id}" becomes "sg_shard_laser_pulse").
+   */
+  Item: string;
+  Amount: number;
+}
+
+/** A fixed recipe: CraftItem takes every Inputs line from the player and gives every Outputs line. */
+export interface CraftRecipe {
+  /** Pass this to CraftItem. */
+  Key: string;
+  /** Display name. May be null. */
+  Name: string | null;
+  /** True when the item keys contain "{id}", so CraftItem needs an id. */
+  HasId: boolean;
+  Inputs: CraftRecipeItem[];
+  Outputs: CraftRecipeItem[];
+}
+
+/**
+ * A fusion: FuseItems takes exactly `Need` copies the player picked, each of an item listed in
+ * Inputs, and gives one random item listed in Results.
+ */
+export interface FusionRecipe {
+  /** Pass this to FuseItems. */
+  Key: string;
+  /** Display name. May be null. */
+  Name: string | null;
+  /** How many copies one fusion takes. */
+  Need: number;
+  /** Your game's item keys a picked copy may be of. */
+  Inputs: string[];
+  /** Your game's item keys the random result may be. */
+  Results: string[];
+}
+
+/** The crafting recipes and fusions of this game, as returned by GetRecipes. */
+export interface RecipesResponse {
+  Recipes: CraftRecipe[];
+  Fusions: FusionRecipe[];
+}
+
+/** Values of CraftResult.Status. */
+export enum CraftStatus {
+  /** Done: the items in Burned were taken and the items in Granted were given. */
+  Succeeded = 'Succeeded',
+  /**
+   * Not confirmed yet. Call again with the same IdempotencyKey (CraftResult.IdempotencyKey) until
+   * the status is Succeeded or Refused; the action never happens twice.
+   */
+  Pending = 'Pending',
+  /** Nothing changed; Reason says why. Trying again needs a new IdempotencyKey. */
+  Refused = 'Refused',
+}
+
+/** Items one kind of item gained or lost in a craft or fusion. */
+export interface CraftResultItem {
+  /** Your game's own item key. */
+  GameItemId: string;
+  /** Ids of the copies taken or given. */
+  UserItemIds: number[];
+}
+
+/** The outcome of CraftItem or FuseItems. */
+export interface CraftResult {
+  /** Id of the action. Quote it when reporting a problem. */
+  OperationId: string;
+  /** A CraftStatus value. */
+  Status: string;
+  /** True when this answer repeats an earlier call made with the same IdempotencyKey. */
+  Replayed: boolean;
+  /** What was taken from the player. Empty unless Status is Succeeded. */
+  Burned: CraftResultItem[];
+  /** What the player received. Empty unless Status is Succeeded. */
+  Granted: CraftResultItem[];
+  /**
+   * Why a Refused action was refused, as a machine-readable string (for example
+   * "not_enough_items", "item_locked", "unknown_game_item_id", "max_supply_reached"); null otherwise.
+   */
+  Reason: string | null;
+  /** Human-readable detail for Reason. May be null. */
+  Message: string | null;
+  /** The key this call used: the one you passed, or the one the SDK generated. */
+  IdempotencyKey: string;
 }
 
 /** Values of RecentReward.Status. */
@@ -1077,6 +1176,19 @@ export enum GhostErrorCode {
   InvalidOutcome = 'InvalidOutcome',
   /** The report's matchData is over 32 KB in UTF-8. Nothing was recorded and the match stays open: report again without it. */
   DataTooLarge = 'DataTooLarge',
+  /** Paid pool: the player's balance is below the entry price. Nothing was charged and no run started. */
+  InsufficientFunds = 'InsufficientFunds',
+  /** Paid pool: the player must complete identity verification before paying an entry. */
+  KycRequired = 'KycRequired',
+  /** Paid pool: the entry cannot be bought right now (no such product or price, the player is suspended, or paid entries are unavailable). */
+  EntryUnavailable = 'EntryUnavailable',
+  /**
+   * Paid pool: the entry payment is not confirmed yet. Call StartGhostRun again: it never charges
+   * twice for one run. Until then the run gets no opponent (FindGhostOpponent rejects with this too).
+   */
+  PaymentPending = 'PaymentPending',
+  /** The player's Funtico session belongs to another game or has expired. Signing in to this game again fixes it. */
+  ReloginRequired = 'ReloginRequired',
   /** The response carried no recognisable code, or the payload signer could not sign the report (nothing was sent). */
   Unknown = 'Unknown'
 }
@@ -1111,6 +1223,16 @@ export interface GhostAttribute {
   Bind: string | null;
 }
 
+/** The entry a paid pool charges for each run. */
+export interface GhostEntry {
+  /** What the entry buys. */
+  Product: string;
+  /** The price tier of the entry. */
+  Tier: string;
+  /** The price in PLAYR as a decimal string ("100"), to show before the player enters. May be null. */
+  DisplayPrice: string | null;
+}
+
 /** A ghost pool of this game and the player's rating in it. */
 export interface GhostPool {
   Key: string;
@@ -1124,6 +1246,22 @@ export interface GhostPool {
   MaxRounds: number | null;
   Attributes: GhostAttribute[];
   Rating: number;
+  /** The entry each run costs; null for a free pool. */
+  Entry: GhostEntry | null;
+}
+
+/** The entry payment of a run in a paid pool. */
+export interface GhostRunEntry {
+  /**
+   * Charged: paid. Pending: not confirmed yet (call StartGhostRun again; it never charges twice).
+   * Refused: not paid. Refunded: paid back (the run was abandoned before its first opponent).
+   * RefundPending: being paid back.
+   */
+  Status: 'Charged' | 'Pending' | 'Refused' | 'Refunded' | 'RefundPending';
+  /** The amount charged in PLAYR as a decimal string, or null. */
+  Amount: string | null;
+  /** The player's PLAYR balance after the charge as a decimal string, or null. */
+  BalanceAfter: string | null;
 }
 
 /** The player's run in a pool. Round = Fights + 1. */
@@ -1142,6 +1280,8 @@ export interface GhostRun {
   MaxRounds: number | null;
   StartedAt: string;
   FinishedAt: string | null;
+  /** The run's entry payment; null in a free pool. */
+  Entry: GhostRunEntry | null;
 }
 
 /** An issued opponent. Report the fight with MatchId, once. */
@@ -2054,6 +2194,56 @@ interface WireInventoryResponse {
   Items: WireInventoryItem[] | null;
 }
 
+/** GET /Inventory/recipes -> one line of a recipe. */
+interface WireCraftRecipeItem {
+  Item: string | null;
+  Amount: number;
+}
+
+/** GET /Inventory/recipes -> one entry of `Recipes`. */
+interface WireCraftRecipe {
+  Key: string | null;
+  Name: string | null;
+  HasId: boolean;
+  Inputs: WireCraftRecipeItem[] | null;
+  Outputs: WireCraftRecipeItem[] | null;
+}
+
+/** GET /Inventory/recipes -> one entry of `Fusions`. */
+interface WireFusionRecipe {
+  Key: string | null;
+  Name: string | null;
+  Need: number;
+  Inputs: string[] | null;
+  Results: string[] | null;
+}
+
+/** GET /Inventory/recipes -> 200 body. */
+interface WireRecipesResponse {
+  Recipes: WireCraftRecipe[] | null;
+  Fusions: WireFusionRecipe[] | null;
+}
+
+/** POST /Inventory/craft and /Inventory/fuse -> one entry of `Burned` / `Granted`. */
+interface WireCraftResultItem {
+  GameItemId: string | null;
+  UserItemIds: number[] | null;
+}
+
+/**
+ * POST /Inventory/craft and /Inventory/fuse -> body of 200 (Succeeded), 202 (Pending) and
+ * 422 (Refused). A 422 without `Status` is an Inventory error body instead.
+ */
+interface WireCraftResult {
+  OperationId: string | null;
+  Status: string | null;
+  Replayed: boolean | null;
+  Burned: WireCraftResultItem[] | null;
+  Granted: WireCraftResultItem[] | null;
+  Reason: string | null;
+  Message: string | null;
+}
+
 /** GET /Rewards/recent -> one item of a reward. */
 interface WireRecentRewardItem {
   ItemId: number;
@@ -2858,7 +3048,8 @@ export class FunticoSDK {
   }
 
   /**
-   * Fresh random v4 UUID: the idempotency key of a join attempt, the id of a practice run.
+   * Fresh random v4 UUID: the idempotency key of a join attempt, a craft or a fusion; the id of a
+   * practice run.
    *
    * crypto.randomUUID() is only exposed in secure contexts, so it is absent (or throws) on plain
    * HTTP - which games served over http:// do hit. Fall back to getRandomValues, and only then to
@@ -4325,9 +4516,9 @@ export class FunticoSDK {
    * `includeOtherItems = true` to also receive platform-wide items the player holds, such as
    * tickets, vouchers and capsules.
    *
-   * Read-only: items are granted by the platform and by server-side flows, never from the game
-   * client. Rejects with an InventoryError; on `ReloginRequired`, sign the player in to this game
-   * again.
+   * Items are granted by the platform and by server-side flows, never from the game client; the
+   * client can only exchange them by the game's recipes and fusions (CraftItem, FuseItems).
+   * Rejects with an InventoryError; on `ReloginRequired`, sign the player in to this game again.
    *
    * Shares the SDK-wide cache window (FunticoConfig.cacheTTL) with the other cached getters.
    */
@@ -4382,6 +4573,61 @@ export class FunticoSDK {
     } catch {
       throw new Error(`Inventory item "${item.Name}" carries properties that are not valid JSON.`);
     }
+  }
+
+  /**
+   * The crafting recipes and fusions of this game: what CraftItem and FuseItems can do.
+   *
+   * Always calls the server. Rejects with an InventoryError.
+   */
+  public async GetRecipes(): Promise<RecipesResponse> {
+    const response = await fetch(`${this.apiUri}/Inventory/recipes`, {
+      headers: this.getAuthHeaders(false)
+    });
+    if (!response.ok) await this.throwInventoryError(response, "Failed to fetch recipes");
+
+    const wire: WireRecipesResponse = await response.json();
+    return {
+      Recipes: (wire.Recipes ?? []).map(recipe => this.mapCraftRecipe(recipe)),
+      Fusions: (wire.Fusions ?? []).map(fusion => this.mapFusionRecipe(fusion))
+    };
+  }
+
+  /**
+   * Crafts by a fixed recipe: takes the recipe's Inputs from the player and gives its Outputs.
+   *
+   * @param recipe         CraftRecipe.Key.
+   * @param id             Fills "{id}" in the recipe's item keys: 1-48 characters of a-z, 0-9 and _.
+   *                       Pass null for a recipe whose HasId is false.
+   * @param idempotencyKey Optional: 8-64 characters of A-Z, a-z, 0-9 and _ . : -. Calls with the same
+   *                       key are one action, done at most once. Omit it and the SDK generates a new
+   *                       key for this call (returned in CraftResult.IdempotencyKey).
+   *
+   * Resolves with the outcome when it is Succeeded, Pending or Refused: a refusal is a normal result,
+   * not an error. On Pending, call again with the same arguments and result.IdempotencyKey. After
+   * Succeeded or Pending the cached inventory is dropped, so the next GetInventory reads fresh.
+   * Rejects with an InventoryError for anything else.
+   */
+  public async CraftItem(recipe: string, id: string | null = null, idempotencyKey: string | null = null): Promise<CraftResult> {
+    const key = idempotencyKey || this.newIdempotencyKey();
+    return this.postCraftAction('craft', { Recipe: recipe, Id: id ?? null, IdempotencyKey: key }, key, "Failed to craft");
+  }
+
+  /**
+   * Fuses copies the player picked: takes them and gives one random item of the fusion's Results.
+   *
+   * @param fusion         FusionRecipe.Key.
+   * @param userItemIds    Exactly `Need` copy ids, each once, taken from InventoryItem.UserItemIds of
+   *                       items listed in the fusion's Inputs. Copies that do not fit reject with
+   *                       `WrongItems`.
+   * @param idempotencyKey Optional, as for CraftItem.
+   *
+   * Resolves and rejects like CraftItem.
+   */
+  public async FuseItems(fusion: string, userItemIds: number[], idempotencyKey: string | null = null): Promise<CraftResult> {
+    const key = idempotencyKey || this.newIdempotencyKey();
+    return this.postCraftAction('fuse', { Fusion: fusion, UserItemIds: [...(userItemIds ?? [])], IdempotencyKey: key }, key,
+      "Failed to fuse items");
   }
 
   /**
@@ -4449,8 +4695,82 @@ export class FunticoSDK {
     };
   }
 
-  private async throwInventoryError(response: Response, fallback: string): Promise<never> {
+  private mapCraftRecipe(wire: WireCraftRecipe): CraftRecipe {
+    const lines = (list: WireCraftRecipeItem[] | null): CraftRecipeItem[] =>
+      (list ?? []).map(line => ({ Item: line.Item ?? '', Amount: line.Amount ?? 1 }));
+    return {
+      Key: wire.Key ?? '',
+      Name: wire.Name ?? null,
+      HasId: wire.HasId === true,
+      Inputs: lines(wire.Inputs),
+      Outputs: lines(wire.Outputs)
+    };
+  }
+
+  private mapFusionRecipe(wire: WireFusionRecipe): FusionRecipe {
+    return {
+      Key: wire.Key ?? '',
+      Name: wire.Name ?? null,
+      Need: wire.Need ?? 0,
+      Inputs: wire.Inputs ?? [],
+      Results: wire.Results ?? []
+    };
+  }
+
+  /**
+   * Sends a craft or a fusion. 200, 202 and 422 answer with the outcome; a 422 without `Status`
+   * and every other failure carry an Inventory error body instead.
+   */
+  private async postCraftAction(path: string, body: object, idempotencyKey: string, fallback: string): Promise<CraftResult> {
+    const response = await fetch(`${this.apiUri}/Inventory/${path}`, {
+      method: "POST",
+      headers: this.getAuthHeaders(),
+      body: JSON.stringify(body)
+    });
     const text = await response.text();
+
+    if (response.ok || response.status === 422) {
+      let wire: WireCraftResult | null = null;
+      try {
+        wire = JSON.parse(text);
+      } catch {
+        // Not a JSON body - handled below.
+      }
+      if (wire && typeof wire.Status === 'string' && wire.Status.length > 0) {
+        const result = this.mapCraftResult(wire, idempotencyKey);
+        // Items moved (or may have): the next GetInventory must read fresh.
+        if (result.Status === CraftStatus.Succeeded || result.Status === CraftStatus.Pending) {
+          this.cachedInventory = null;
+          this.cachedInventoryWithOtherItems = null;
+        }
+        return result;
+      }
+      if (response.ok) {
+        throw new InventoryError(InventoryErrorCode.Unknown, `${fallback}: the response carried no status.`);
+      }
+    }
+
+    return this.throwInventoryError(response, fallback, text);
+  }
+
+  private mapCraftResult(wire: WireCraftResult, idempotencyKey: string): CraftResult {
+    const items = (list: WireCraftResultItem[] | null): CraftResultItem[] =>
+      (list ?? []).map(item => ({ GameItemId: item.GameItemId ?? '', UserItemIds: item.UserItemIds ?? [] }));
+    return {
+      OperationId: wire.OperationId ?? '',
+      Status: wire.Status ?? '',
+      Replayed: wire.Replayed === true,
+      Burned: items(wire.Burned),
+      Granted: items(wire.Granted),
+      Reason: wire.Reason ?? null,
+      Message: wire.Message ?? null,
+      IdempotencyKey: idempotencyKey
+    };
+  }
+
+  /** `bodyText`: the response body when the caller has already read it. */
+  private async throwInventoryError(response: Response, fallback: string, bodyText?: string): Promise<never> {
+    const text = bodyText ?? await response.text();
     let code = InventoryErrorCode.Unknown;
     let message = text || `HTTP ${response.status}`;
 
@@ -4486,7 +4806,11 @@ export class FunticoSDK {
     if (!response.ok) await this.throwGhostError(response, "Failed to fetch ghost pools");
 
     const wire: { Pools: GhostPool[] | null } = await response.json();
-    return (wire.Pools ?? []).map(pool => ({ ...pool, Attributes: pool.Attributes ?? [] }));
+    return (wire.Pools ?? []).map(pool => ({
+      ...pool,
+      Attributes: pool.Attributes ?? [],
+      Entry: pool.Entry ? { ...pool.Entry, DisplayPrice: pool.Entry.DisplayPrice ?? null } : null
+    }));
   }
 
   /** The player's active run in the pool and its open match, if any (resume after a reload). */
@@ -4494,12 +4818,25 @@ export class FunticoSDK {
     return this.ghostRunCall('GET', 'run', pool, "Failed to fetch the ghost run");
   }
 
-  /** Starts a run in a pool with runs, or returns the active one. */
+  /**
+   * Starts a run in a pool with runs, or returns the active one.
+   *
+   * In a paid pool (GhostPool.Entry set) this charges the entry, once per run: calling it again
+   * resumes the same run and never charges again. Rejects with `InsufficientFunds`, `KycRequired`
+   * or `EntryUnavailable` when the entry cannot be paid (no run is started), and with
+   * `PaymentPending` while the payment is not confirmed yet - call it again later.
+   */
   public async StartGhostRun(pool: string): Promise<GhostRunState> {
     return this.ghostRunCall('POST', 'run/start', pool, "Failed to start a ghost run");
   }
 
-  /** Gives up the active run. An open match counts as not reported (usually a loss). */
+  /**
+   * Gives up the active run. An open match counts as not reported (usually a loss).
+   *
+   * In a paid pool, abandoning before the run got its first opponent refunds the entry (the run's
+   * Entry.Status becomes Refunded, or RefundPending while the refund is on its way). After an
+   * opponent was issued there is no refund.
+   */
   public async AbandonGhostRun(pool: string): Promise<GhostRunState> {
     return this.ghostRunCall('POST', 'run/abandon', pool, "Failed to abandon the ghost run");
   }
@@ -4509,7 +4846,8 @@ export class FunticoSDK {
    * be omitted: the server fills them) and, optionally, the player's own ship to store in the
    * same request. Searching again before reporting returns the same match.
    *
-   * Rejects with GhostError; `NoOpponent` is a normal outcome.
+   * Rejects with GhostError; `NoOpponent` is a normal outcome. In a paid pool it rejects with
+   * `PaymentPending` until the run's entry payment is confirmed (see StartGhostRun).
    */
   public async FindGhostOpponent(pool: string, attributes: Record<string, number>, options: GhostFindOptions = {}): Promise<GhostFindResult> {
     const response = await fetch(`${this.apiUri}/Ghost/find`, {
@@ -4528,7 +4866,7 @@ export class FunticoSDK {
     const wire: GhostFindResult = await response.json();
     return {
       Match: this.mapGhostMatch(wire.Match),
-      Run: wire.Run ?? null,
+      Run: this.mapGhostRun(wire.Run),
       UploadedSnapshotId: wire.UploadedSnapshotId ?? null
     };
   }
@@ -4584,7 +4922,7 @@ export class FunticoSDK {
     if (!response.ok) await this.throwGhostError(response, "Failed to report the ghost fight");
 
     const wire: GhostReportResult = await response.json();
-    return { ...wire, Run: wire.Run ?? null };
+    return { ...wire, Run: this.mapGhostRun(wire.Run) };
   }
 
   /** What the player's ghosts did since the previous call; the call resets the "New" counters. */
@@ -4633,13 +4971,23 @@ export class FunticoSDK {
 
     const wire: GhostRunState = await response.json();
     return {
-      Run: wire.Run ?? null,
+      Run: this.mapGhostRun(wire.Run),
       OpenMatch: wire.OpenMatch ? this.mapGhostMatch(wire.OpenMatch) : null
     };
   }
 
   private mapGhostMatch(wire: GhostMatch): GhostMatch {
     return { ...wire, OpponentAttributes: wire.OpponentAttributes ?? {} };
+  }
+
+  // Entry is null in a free pool (and absent from older answers).
+  private mapGhostRun(wire: GhostRun | null | undefined): GhostRun | null {
+    if (!wire) return null;
+    const entry = wire.Entry;
+    return {
+      ...wire,
+      Entry: entry ? { Status: entry.Status, Amount: entry.Amount ?? null, BalanceAfter: entry.BalanceAfter ?? null } : null
+    };
   }
 
   private async throwGhostError(response: Response, fallback: string): Promise<never> {
