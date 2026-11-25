@@ -1526,6 +1526,18 @@ export interface CommunityGoalPaidAttempts {
   DisplayPrice: string | null;
   /** Paid attempts per player per UTC day across the whole chain; 0 means no limit. */
   PerDay: number;
+  /** What a completed paid attempt pays on top of its contribution (for example a chest on the third of the day). */
+  Rewards: CommunityGoalPaidReward[];
+}
+
+/** One reward of a chain's paid attempts. */
+export interface CommunityGoalPaidReward {
+  /** Only the player's n-th paid attempt of the UTC day (1 = the first); null = every paid attempt. */
+  OnPaidOfDay: number | null;
+  /** What it is, as the chain's rules name it (for example 'chest_epic'); the reward's Key once paid. */
+  Code: string;
+  /** Chance in percent that it pays; 100 = always. */
+  ChancePct: number;
 }
 
 /** The payment of one paid attempt. */
@@ -1620,6 +1632,8 @@ export interface GoalAttempt {
   StartData: string | null;
   /** True for a paid attempt. */
   Paid: boolean;
+  /** A paid attempt: the player's n-th paid attempt of its UTC day in the chain (1-based); null for a free one. */
+  PaidOfDay: number | null;
 }
 
 /** Who landed the hit that reached a goal's target. */
@@ -1791,6 +1805,11 @@ export interface GoalAttemptResult {
   /** Paid attempts left today; null when the chain sells none or has no limit on them. */
   PaidAttemptsLeftToday: number | null;
   ResetsAt: string;
+  /**
+   * A completed paid attempt: what it paid on top of its contribution (the chain's PaidAttempts.Rewards), each with its
+   * delivery status; empty for a free attempt or when it earned none. The same on a repeated completion.
+   */
+  Rewards: RecentReward[];
 }
 
 export interface CommunityGoalLeaderboardEntry {
@@ -5239,7 +5258,8 @@ export class FunticoSDK {
     const wire: GoalAttemptResult = await response.json();
     return {
       ...wire, MilestonesCrossed: wire.MilestonesCrossed ?? [], NextGoalId: wire.NextGoalId ?? null, Place: wire.Place ?? null,
-      Best: wire.Best ?? 0, IsNewBest: wire.IsNewBest ?? false, PaidAttemptsLeftToday: wire.PaidAttemptsLeftToday ?? null
+      Best: wire.Best ?? 0, IsNewBest: wire.IsNewBest ?? false, PaidAttemptsLeftToday: wire.PaidAttemptsLeftToday ?? null,
+      Rewards: ((wire as { Rewards?: WireRecentReward[] | null }).Rewards ?? []).map(reward => this.mapRecentReward(reward))
     };
   }
 
@@ -5378,7 +5398,10 @@ export class FunticoSDK {
       ...wire,
       Chain: {
         ...wire.Chain, Milestones: wire.Chain?.Milestones ?? [],
-        PaidAttempts: paid ? { ...paid, DisplayPrice: paid.DisplayPrice ?? null, PerDay: paid.PerDay ?? 0 } : null
+        PaidAttempts: paid ? {
+          ...paid, DisplayPrice: paid.DisplayPrice ?? null, PerDay: paid.PerDay ?? 0,
+          Rewards: (paid.Rewards ?? []).map(r => ({ OnPaidOfDay: r.OnPaidOfDay ?? null, Code: r.Code, ChancePct: r.ChancePct ?? 100 }))
+        } : null
       },
       Goal: this.mapCommunityGoal(wire.Goal),
       Me: me ? {
@@ -5392,7 +5415,10 @@ export class FunticoSDK {
 
   private mapGoalAttempt(wire: GoalAttempt | null | undefined): GoalAttempt | null {
     if (!wire) return null;
-    return { ...wire, MilestonesAtStart: wire.MilestonesAtStart ?? [], StartData: wire.StartData ?? null, Paid: wire.Paid ?? false };
+    return {
+      ...wire, MilestonesAtStart: wire.MilestonesAtStart ?? [], StartData: wire.StartData ?? null, Paid: wire.Paid ?? false,
+      PaidOfDay: wire.PaidOfDay ?? null
+    };
   }
 
   private mapClosedBy(wire: CommunityGoalClosedBy | null | undefined): CommunityGoalClosedBy | null {
